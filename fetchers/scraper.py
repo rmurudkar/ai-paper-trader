@@ -14,9 +14,10 @@ If both fail: return snippet, set partial:true
 from typing import Dict, Optional
 
 
-def scrape_article_fallback(url: str, snippet: str) -> Dict:
+def scrape(url: str, snippet: str = "") -> Dict:
     """FALLBACK ONLY — scrape full article text when licensed sources fail.
 
+    Step 3 of waterfall enrichment for NewsAPI.ai articles.
     Never called directly from anywhere except aggregator.py waterfall enrichment.
 
     Skip list (return snippet only): wsj.com, ft.com, bloomberg.com, nytimes.com
@@ -37,65 +38,26 @@ def scrape_article_fallback(url: str, snippet: str) -> Dict:
     pass
 
 
-def is_paywalled_domain(url: str) -> bool:
-    """Check if URL is from known paywalled/skip-list domains.
-
-    Skip list: wsj.com, ft.com, bloomberg.com, nytimes.com
-
-    Args:
-        url: Article URL to check.
-
-    Returns:
-        True if domain should be skipped (use snippet only).
-    """
+def _is_paywalled_domain(url: str) -> bool:
+    """Private: Check if URL is from known paywalled/skip-list domains."""
     pass
 
 
-def scrape_with_trafilatura(url: str) -> Optional[str]:
-    """Primary scraping method using trafilatura.
-
-    Args:
-        url: Article URL to scrape.
-
-    Returns:
-        Extracted article text or None if extraction failed.
-    """
+def _scrape_with_trafilatura(url: str) -> Optional[str]:
+    """Private: Primary scraping method using trafilatura."""
     pass
 
 
-def scrape_with_newspaper3k(url: str) -> Optional[str]:
-    """Fallback scraping method using newspaper3k.
-
-    Args:
-        url: Article URL to scrape.
-
-    Returns:
-        Extracted article text or None if extraction failed.
-    """
+def _scrape_with_newspaper3k(url: str) -> Optional[str]:
+    """Private: Fallback scraping method using newspaper3k."""
     pass
 
 
-def truncate_to_words(text: str, max_words: int = 1200) -> str:
-    """Truncate text to maximum word count preserving word boundaries.
-
-    Args:
-        text: Text to truncate.
-        max_words: Maximum number of words (default 1200).
-
-    Returns:
-        Truncated text.
-    """
+def _truncate_to_words(text: str, max_words: int = 1200) -> str:
+    """Private: Truncate text to maximum word count preserving word boundaries."""
     pass
 
 
-def validate_scraped_content(text: str, min_words: int = 50) -> bool:
-    """Validate that scraped content meets minimum quality standards.
-
-    Args:
-        text: Scraped article text.
-        min_words: Minimum word count for valid article.
-
-    Returns:
-        True if content is valid, False otherwise.
-    """
+def _validate_scraped_content(text: str, min_words: int = 50) -> bool:
+    """Private: Validate that scraped content meets minimum quality standards."""
     pass

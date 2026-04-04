@@ -4,20 +4,10 @@ import yfinance as yf
 from typing import Dict, List
 
 
-def get_ticker_data(ticker: str) -> Dict:
-    """Fetch price, volume, 50MA, 200MA for a single ticker.
+def fetch_market_data(watchlist: List[str]) -> Dict[str, Dict]:
+    """Fetch market data for all tickers in watchlist via yfinance.
 
-    Args:
-        ticker: Stock ticker symbol (e.g. 'AAPL').
-
-    Returns:
-        Dict with keys: price, volume, ma_50, ma_200, ticker.
-    """
-    pass
-
-
-def get_watchlist_data(watchlist: List[str]) -> Dict[str, Dict]:
-    """Fetch market data for all tickers in watchlist.
+    Per ticker: current price, volume, 50-day MA, 200-day MA
 
     Args:
         watchlist: List of ticker symbols.
@@ -29,38 +19,21 @@ def get_watchlist_data(watchlist: List[str]) -> Dict[str, Dict]:
     pass
 
 
-def calculate_moving_averages(ticker: str, periods: List[int] = [50, 200]) -> Dict[str, float]:
-    """Calculate moving averages for a ticker.
-
-    Args:
-        ticker: Stock ticker symbol.
-        periods: List of MA periods to calculate (default [50, 200]).
-
-    Returns:
-        Dict with keys like 'ma_50', 'ma_200' mapped to float values.
-    """
+def _get_ticker_data(ticker: str) -> Dict:
+    """Private: Fetch price, volume, 50MA, 200MA for a single ticker."""
     pass
 
 
-def get_current_price(ticker: str) -> float:
-    """Fetch the latest market price for a ticker.
-
-    Args:
-        ticker: Stock ticker symbol (e.g. 'AAPL').
-
-    Returns:
-        Current price as a float.
-    """
+def _calculate_moving_averages(ticker: str, periods: List[int] = [50, 200]) -> Dict[str, float]:
+    """Private: Calculate moving averages for a ticker."""
     pass
 
 
-def get_volume(ticker: str) -> int:
-    """Fetch the latest trading volume for a ticker.
+def _get_current_price(ticker: str) -> float:
+    """Private: Fetch the latest market price for a ticker."""
+    pass
 
-    Args:
-        ticker: Stock ticker symbol.
 
-    Returns:
-        Current volume as an integer.
-    """
+def _get_volume(ticker: str) -> int:
+    """Private: Fetch the latest trading volume for a ticker."""
     pass
