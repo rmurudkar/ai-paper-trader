@@ -1,6 +1,45 @@
-"""yfinance client for fetching market data."""
+"""yfinance client for price, volume, and moving average data."""
 
 import yfinance as yf
+from typing import Dict, List
+
+
+def get_ticker_data(ticker: str) -> Dict:
+    """Fetch price, volume, 50MA, 200MA for a single ticker.
+
+    Args:
+        ticker: Stock ticker symbol (e.g. 'AAPL').
+
+    Returns:
+        Dict with keys: price, volume, ma_50, ma_200, ticker.
+    """
+    pass
+
+
+def get_watchlist_data(watchlist: List[str]) -> Dict[str, Dict]:
+    """Fetch market data for all tickers in watchlist.
+
+    Args:
+        watchlist: List of ticker symbols.
+
+    Returns:
+        Dict keyed by ticker symbol, values are dicts with:
+        price, volume, ma_50, ma_200.
+    """
+    pass
+
+
+def calculate_moving_averages(ticker: str, periods: List[int] = [50, 200]) -> Dict[str, float]:
+    """Calculate moving averages for a ticker.
+
+    Args:
+        ticker: Stock ticker symbol.
+        periods: List of MA periods to calculate (default [50, 200]).
+
+    Returns:
+        Dict with keys like 'ma_50', 'ma_200' mapped to float values.
+    """
+    pass
 
 
 def get_current_price(ticker: str) -> float:
@@ -15,27 +54,13 @@ def get_current_price(ticker: str) -> float:
     pass
 
 
-def get_historical_prices(ticker: str, period: str = "1mo", interval: str = "1d"):
-    """Fetch historical OHLCV data for a ticker.
-
-    Args:
-        ticker: Stock ticker symbol.
-        period: Lookback period (e.g. '1d', '5d', '1mo', '3mo', '1y').
-        interval: Data interval (e.g. '1m', '5m', '1h', '1d').
-
-    Returns:
-        pandas DataFrame with columns: Open, High, Low, Close, Volume.
-    """
-    pass
-
-
-def get_ticker_info(ticker: str) -> dict:
-    """Fetch metadata for a ticker (sector, market cap, etc.).
+def get_volume(ticker: str) -> int:
+    """Fetch the latest trading volume for a ticker.
 
     Args:
         ticker: Stock ticker symbol.
 
     Returns:
-        Dict of ticker metadata from yfinance.
+        Current volume as an integer.
     """
     pass

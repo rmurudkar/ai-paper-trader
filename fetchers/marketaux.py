@@ -1,32 +1,23 @@
-"""Marketaux API client for ticker-tagged stock/financial news."""
+"""Marketaux API client for ticker-tagged financial news."""
 
 import os
 import requests
 from typing import List, Dict
 
 
-def fetch_ticker_news(ticker: str, max_results: int = 10) -> List[Dict]:
-    """Fetch ticker-tagged stock/financial news from Marketaux API.
+def fetch_news(tickers: List[str] = None, max_results: int = 20) -> List[Dict]:
+    """Fetch ticker-tagged financial news from Marketaux API.
 
-    Extracts pre-built sentiment scores per ticker. Do NOT re-analyze these with Claude.
+    Extracts pre-built sentiment_score per ticker (-1.0 to 1.0).
+    DO NOT re-analyze Marketaux sentiment with Claude — use it directly.
 
     Args:
-        ticker: Stock ticker symbol (e.g. 'AAPL').
+        tickers: List of stock ticker symbols to filter for (e.g. ['AAPL', 'MSFT']).
+                If None, fetches general financial news.
         max_results: Maximum number of articles to return.
 
     Returns:
-        List of dicts with keys: title, ticker, sentiment_score, url, published_at.
-    """
-    pass
-
-
-def fetch_financial_news(max_results: int = 20) -> List[Dict]:
-    """Fetch general financial news with ticker tags from Marketaux API.
-
-    Args:
-        max_results: Maximum number of articles to return.
-
-    Returns:
-        List of dicts with keys: title, ticker, sentiment_score, url, published_at.
+        List of dicts with keys: title, ticker, sentiment_score, snippet, url, published_at, source.
+        Source field is always "marketaux".
     """
     pass
