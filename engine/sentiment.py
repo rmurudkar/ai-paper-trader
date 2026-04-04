@@ -2,6 +2,7 @@
 
 import os
 import anthropic
+from fetchers.aggregator import fetch_all_news
 
 
 def analyze_sentiment(headlines: list[str]) -> dict:

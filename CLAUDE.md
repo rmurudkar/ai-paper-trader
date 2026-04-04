@@ -18,3 +18,25 @@ Python app that fetches financial news, analyzes sentiment with Claude API, gene
 - dashboard/app.py — Streamlit UI
 - .env.example — API key template
 - requirements.txt
+
+## News Fetching Architecture (updated)
+Split fetchers/news.py into three files:
+
+- fetchers/marketaux.py — Marketaux API client
+  - fetch ticker-tagged stock/financial news
+  - extract pre-built sentiment scores per ticker (do NOT re-analyze these with Claude)
+  - returns: list of {title, ticker, sentiment_score, url, published_at}
+
+- fetchers/newsapi.py — NewsAPI.ai client  
+  - fetch macro, geopolitical, economic headlines
+  - no pre-built sentiment — these go to Claude for analysis
+  - returns: list of {title, summary, topics, url, published_at}
+
+- fetchers/aggregator.py — merge + dedup
+  - combines output of both fetchers
+  - deduplicates by URL and title similarity
+  - tags each item with source: "marketaux" | "newsapi"
+  - returns unified list for engine/sentiment.py
+
+Remove: fetchers/news.py (replaced by above 3 files)
+Update: any imports in engine/sentiment.py to use aggregator output
