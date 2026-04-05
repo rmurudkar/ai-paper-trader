@@ -1,0 +1,300 @@
+"""
+Integration tests for fetchers/newsapi.py — hits the real NewsAPI.ai API.
+Requires NEWSAPI_AI_KEY in .env
+
+Run: python test_newsapi.py
+"""
+
+import os
+import sys
+import json
+import logging
+
+sys.path.insert(0, os.path.dirname(__file__))
+logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(message)s')
+
+from fetchers.newsapi import (
+    fetch_headlines,
+    _fetch_articles,
+    _filter_by_ticker_relevance,
+    _TOPIC_KEYWORDS,
+    DEFAULT_TOPICS,
+    SNIPPET_MAX_CHARS,
+)
+
+print("=" * 60)
+print("NEWSAPI.PY INTEGRATION TEST SUITE")
+print("=" * 60)
+
+#################################
+# SECTION 1: API key check — fail fast if not configured
+
+print("\n--- SECTION 1: API key present ---")
+api_key = os.getenv("NEWSAPI_AI_KEY")
+if not api_key:
+    print("FAIL: NEWSAPI_AI_KEY not set in environment. Set it in .env and retry.")
+    sys.exit(1)
+print(f"  NEWSAPI_AI_KEY: {'*' * 8}{api_key[-4:]}")
+print("PASS")
+
+#################################
+# SECTION 1b: Raw API probe — show exact request/response before any parsing
+
+print("\n--- SECTION 1b: Raw API probe ---")
+import requests
+from fetchers.newsapi import NEWSAPI_BASE_URL
+
+def _probe(label, payload):
+    resp = requests.post(
+        NEWSAPI_BASE_URL,
+        json=payload,
+        headers={'Content-Type': 'application/json'},
+        timeout=30,
+    )
+    block = resp.json().get("articles", {})
+    count = len(block.get("results", []))
+    total = block.get("totalResults", 0)
+    print(f"  [{label}] HTTP {resp.status_code} → totalResults={total}, results={count}")
+    return count
+
+base_query = {
+    'apiKey': api_key,
+    'isDuplicateFilter': 'skipDuplicates',
+    'dataType': ['news'],
+    'articlesPage': 1,
+    'articlesCount': 3,
+    'articlesSortBy': 'date',
+    'articlesSortByAsc': False,
+    'includeArticleTitle': True,
+    'includeArticleBody': True,
+    'includeArticleUrl': True,
+    'includeArticlePublishDate': True,
+    'includeArticleSource': True,
+    'includeArticleCategories': False,
+    'includeArticleConcepts': False,
+}
+
+def make_query(keyword):
+    return {**base_query, '$query': {'$and': [
+        {'keyword': keyword, 'keywordLoc': 'title,body'},
+        {'lang': 'eng'},
+    ]}}
+
+_probe("$query inflation",  make_query('inflation'))
+_probe("$query tariff",     make_query('tariff'))
+_probe("$query recession",  make_query('recession'))
+_probe("$query earnings",   make_query('earnings'))
+_probe("$query oil",        make_query('oil'))
+
+print("PASS (probe complete)")
+
+#################################
+# SECTION 2: _fetch_articles — single topic, real HTTP call
+
+print("\n--- SECTION 2: _fetch_articles for 'macro' (live API) ---")
+articles = _fetch_articles(_TOPIC_KEYWORDS["macro"], "macro", max_results=5)
+
+print(f"  Articles returned: {len(articles)}")
+assert isinstance(articles, list), "Expected a list"
+assert len(articles) > 0, "Expected at least 1 article — check API key and quota"
+
+for i, a in enumerate(articles):
+    assert "title" in a and a["title"], f"Article {i} missing title"
+    assert "url" in a and a["url"], f"Article {i} missing url"
+    assert "snippet" in a, f"Article {i} missing snippet"
+    assert "published_at" in a, f"Article {i} missing published_at"
+    assert a["source"] == "newsapi", f"Article {i} wrong source: {a['source']}"
+    assert a["needs_full_text"] is True, f"Article {i} needs_full_text must be True"
+    assert a["topics"] == ["macro"], f"Article {i} wrong topics: {a['topics']}"
+    assert len(a["snippet"]) <= SNIPPET_MAX_CHARS, f"Article {i} snippet too long"
+    print(f"  [{i}] {a['title'][:70]}")
+    print(f"       url          : {a['url'][:60]}")
+    print(f"       published_at : {a['published_at']}")
+    print(f"       snippet len  : {len(a['snippet'])} chars")
+
+print("PASS")
+
+#################################
+# SECTION 3: _fetch_articles — geopolitical topic
+
+print("\n--- SECTION 3: _fetch_articles for 'geopolitical' (live API) ---")
+articles = _fetch_articles(_TOPIC_KEYWORDS["geopolitical"], "geopolitical", max_results=5)
+
+print(f"  Articles returned: {len(articles)}")
+assert isinstance(articles, list)
+for a in articles:
+    assert a["topics"] == ["geopolitical"]
+    assert a["needs_full_text"] is True
+    print(f"  - {a['title'][:80]}")
+
+print("PASS")
+
+#################################
+# SECTION 4: _fetch_articles — economic topic
+
+print("\n--- SECTION 4: _fetch_articles for 'economic' (live API) ---")
+articles = _fetch_articles(_TOPIC_KEYWORDS["economic"], "economic", max_results=5)
+
+print(f"  Articles returned: {len(articles)}")
+assert isinstance(articles, list)
+for a in articles:
+    assert a["topics"] == ["economic"]
+    print(f"  - {a['title'][:80]}")
+
+print("PASS")
+
+#################################
+# SECTION 5: fetch_headlines — default topics, default max_results
+
+print("\n--- SECTION 5: fetch_headlines() with all defaults (live API) ---")
+headlines = fetch_headlines()
+
+print(f"  Articles returned : {len(headlines)}")
+assert isinstance(headlines, list)
+assert len(headlines) > 0, "Expected results from fetch_headlines()"
+
+topics_seen = set()
+for a in headlines:
+    assert "title" in a and a["title"]
+    assert "url" in a and a["url"]
+    assert "snippet" in a
+    assert "topics" in a and isinstance(a["topics"], list)
+    assert "published_at" in a
+    assert a["source"] == "newsapi"
+    assert a["needs_full_text"] is True
+    topics_seen.update(a["topics"])
+
+print(f"  Topics present    : {sorted(topics_seen)}")
+print(f"  Default topics    : {DEFAULT_TOPICS}")
+
+for a in headlines[:5]:
+    print(f"\n  title      : {a['title'][:70]}")
+    print(f"  topics     : {a['topics']}")
+    print(f"  published  : {a['published_at']}")
+    print(f"  snippet    : {a['snippet'][:100]}...")
+
+print("PASS")
+
+#################################
+# SECTION 6: fetch_headlines — sorted descending by published_at
+
+print("\n--- SECTION 6: fetch_headlines sort order ---")
+dates = [a["published_at"] for a in headlines if a["published_at"]]
+sorted_dates = sorted(dates, reverse=True)
+assert dates == sorted_dates, f"Results not sorted descending.\nGot: {dates}\nExpected: {sorted_dates}"
+print(f"  First : {dates[0]}")
+print(f"  Last  : {dates[-1]}")
+print("PASS")
+
+#################################
+# SECTION 7: fetch_headlines — explicit single topic
+
+print("\n--- SECTION 7: fetch_headlines(topics=['macro']) ---")
+macro_only = fetch_headlines(topics=["macro"], max_results=5)
+
+print(f"  Articles returned: {len(macro_only)}")
+assert len(macro_only) > 0
+for a in macro_only:
+    assert a["topics"] == ["macro"], f"Expected ['macro'], got {a['topics']}"
+    print(f"  - {a['title'][:80]}")
+
+print("PASS")
+
+#################################
+# SECTION 8: fetch_headlines — multi-topic selection
+
+print("\n--- SECTION 8: fetch_headlines(topics=['energy', 'crypto']) ---")
+subset = fetch_headlines(topics=["energy", "crypto"], max_results=10)
+
+print(f"  Articles returned: {len(subset)}")
+assert isinstance(subset, list)
+topics_in_result = set()
+for a in subset:
+    topics_in_result.update(a["topics"])
+    assert a["topics"][0] in {"energy", "crypto"}, f"Unexpected topic: {a['topics']}"
+
+print(f"  Topics in results: {topics_in_result}")
+for a in subset[:5]:
+    print(f"  [{a['topics'][0]:12}] {a['title'][:65]}")
+
+print("PASS")
+
+#################################
+# SECTION 9: fetch_headlines — no duplicate URLs in results
+
+print("\n--- SECTION 9: fetch_headlines deduplication ---")
+all_headlines = fetch_headlines(max_results=30)
+urls = [a["url"] for a in all_headlines]
+unique_urls = set(urls)
+duplicates = len(urls) - len(unique_urls)
+print(f"  Total articles : {len(urls)}")
+print(f"  Unique URLs    : {len(unique_urls)}")
+print(f"  Duplicates     : {duplicates}")
+assert duplicates == 0, f"Found {duplicates} duplicate URLs"
+print("PASS")
+
+#################################
+# SECTION 10: fetch_headlines — max_results respected
+
+print("\n--- SECTION 10: fetch_headlines max_results cap ---")
+for cap in [5, 10, 20]:
+    result = fetch_headlines(max_results=cap)
+    print(f"  max_results={cap:2d} → returned {len(result)}")
+    assert len(result) <= cap, f"Returned {len(result)} but cap was {cap}"
+
+print("PASS")
+
+#################################
+# SECTION 11: _filter_by_ticker_relevance — live articles + watchlist
+
+print("\n--- SECTION 11: _filter_by_ticker_relevance on live headlines ---")
+headlines = fetch_headlines(max_results=20)
+watchlist = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA", "JPM", "SPY", "QQQ"]
+filtered = _filter_by_ticker_relevance(headlines, watchlist)
+
+broad_topics = {"macro", "geopolitical", "energy"}
+broad_articles = [a for a in headlines if any(t in broad_topics for t in a["topics"])]
+
+print(f"  Total headlines   : {len(headlines)}")
+print(f"  After filtering   : {len(filtered)}")
+print(f"  Broad-topic floor : {len(broad_articles)} (should all pass through)")
+
+# All broad-topic articles must be in filtered
+for a in broad_articles:
+    assert a in filtered, f"Broad-topic article was incorrectly filtered: {a['title']}"
+
+print("PASS")
+
+#################################
+# SECTION 12: _fetch_articles — invalid API key returns empty list
+
+print("\n--- SECTION 12: Invalid API key returns [] gracefully ---")
+import os
+original_key = os.environ.get("NEWSAPI_AI_KEY")
+os.environ["NEWSAPI_AI_KEY"] = "invalid-key-000"
+
+result = _fetch_articles(_TOPIC_KEYWORDS["macro"], "macro", max_results=3)
+print(f"  Result with bad key: {result}")
+assert isinstance(result, list), "Should always return a list"
+# API may return HTTP error or an error payload — either way we get [] or a list
+# (no exception should propagate)
+
+if original_key:
+    os.environ["NEWSAPI_AI_KEY"] = original_key
+print("  No exception raised, returned list")
+print("PASS")
+
+#################################
+# SECTION 13: Full pipeline dump — print raw JSON of first 3 articles
+
+print("\n--- SECTION 13: Raw output of first 3 articles ---")
+headlines = fetch_headlines(max_results=3)
+print(json.dumps(headlines, indent=2, default=str))
+print("PASS")
+
+#################################
+# SUMMARY
+
+print("\n" + "=" * 60)
+print("ALL INTEGRATION TESTS PASSED")
+print("=" * 60)

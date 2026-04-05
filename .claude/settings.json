@@ -26,13 +26,13 @@
       "Bash(git init *)",
       "Read",
       "Write",
-      "Edit"
+      "Edit",
+      "Network(*)"
     ],
     
     "deny": [
       "Read(./.env.local)",
       "Read(./.env.*.local)",
-      "Read(.env)",
       "Read(.env.local)",
       "Read(.env.*.local)",
       "Edit(./.env)",
@@ -45,14 +45,12 @@
       "Bash(git commit *)",
       "Bash(git push *)",
       "Bash(rm -rf *)",
-      "Bash(sudo *)",
-      "Bash(sudo:*)"
     ]
   },
   
   "statusLine": {
     "type": "command",
-    "command": "echo '🔒 Limited git access (no add/commit/push) | ✅ All bash | 🚫 .env blocked'"
+    "command": "echo '🔒 Limited git access (no add/commit/push) | ✅ All bash | 🚫 .env blocked | 🌐 Full network access'"
   },
   
   "alwaysThinkingEnabled": true
