@@ -1,234 +1,225 @@
-# Architecture Migration Audit
+# Architecture Audit
+Generated: 2026-04-05
 
-This audit identifies all files that need changes to work with the new autonomous paper trading architecture. Changes are needed to integrate with the discovery engine, Turso database, new signal combination system, and comprehensive feedback loop.
-
-## Core Architecture Changes
-
-**Key Principles:**
-- Discovery engine runs FIRST in every cycle - no hardcoded ticker lists
-- All data flows through Turso database, not local files  
-- Signals flow: strategies → combiner → risk manager → executor
-- Every trade logged with full attribution for feedback loop
-- Circuit breaker protection integrated throughout
+> Fresh audit of current codebase state against CLAUDE.md specification.
+> Completeness issues (partial implementations) are listed before missing files.
 
 ---
 
-## Files Requiring Updates
+## Priority 1 — Incomplete Implementations
+*Files that exist but are only partially built. These block the pipeline more
+than missing files because they create false confidence.*
 
-### fetchers/marketaux.py
-- [x] Add `broad=True` mode to fetch without ticker filter (Task 2 — completed)
-- [ ] **Implement broad mode logic**: Currently has TODO comment, needs actual implementation
-- [ ] **Accept dynamic ticker list**: Replace TICKER_MODE env var logic with direct parameter
-- [ ] **Return discovery-compatible format**: Ensure ticker extraction works for discovery.py
-- [ ] **Turso integration**: Replace any local caching with database calls
+### fetchers/discovery.py — PARTIAL + VIOLATION
+- [x] Returns dict with keys: `tickers`, `sources`, `mode`
+- [x] Supports `TICKER_MODE=watchlist` mode
+- [x] Supports `TICKER_MODE=discovery` mode
+- [ ] News-driven discovery: tickers with 2+ mentions in last 4 hours — **uses hardcoded `SP500_TICKERS[:20]` as fallback sample instead of dynamic extraction**
+- [ ] Market movers: top 5 gainers + top 5 losers fetched dynamically from yfinance — **references hardcoded `SP500_TICKERS` list instead**
+- [ ] Sector rotation scan: top/bottom 2 sector ETFs with top 3 holdings fetched via yfinance — **uses hardcoded `SECTOR_ETF_HOLDINGS` dict with fixed holdings instead of live yfinance data**
+- [x] Existing positions always included
+- [x] Pinned WATCHLIST tickers always included in discovery mode
+- [x] Dedup + cap at `MAX_DISCOVERY_TICKERS`
+- [x] `sources` dict maps each ticker to list of source reasons
+- [ ] **VIOLATION**: `SP500_TICKERS` hardcoded list at line 98 — dynamic yfinance scan required
+- [ ] **VIOLATION**: `SECTOR_ETF_HOLDINGS` hardcoded dict at line 110 — holdings must be fetched from yfinance, not hardcoded
 
-### fetchers/newsapi.py
-- [x] Add `broad=True` mode to fetch without ticker filter (Task 2 — completed)
-- [ ] **Implement broad mode logic**: Currently has TODO comment, needs actual implementation
-- [ ] **Discovery integration**: Ensure ticker extraction feeds back to discovery engine
-- [ ] **Remove legacy watchlist handling**: Replace with discovery_context parameter usage
-- [ ] **Turso integration**: Any caching should use database, not local storage
+### fetchers/marketaux.py — PARTIAL
+- [x] `fetch_news()` makes real API requests
+- [x] Watchlist mode: fetches filtered to provided tickers
+- [ ] `broad=True` parameter is accepted but **silently ignored** — function only reads `TICKER_MODE` env var, never uses the `broad` argument passed by caller
+- [x] Extracts pre-built `sentiment_score` per ticker from API response
+- [x] Returns all required fields: `title`, `ticker`, `sentiment_score`, `snippet`, `url`, `published_at`, `source`
+- [x] `source` field set to `"marketaux"` on every item
+- [x] Rate limiting logic implemented (80/100 daily request warning)
 
-### fetchers/market.py
-- [ ] **CRITICAL: Full implementation needed**: Currently just stubs with pass statements
-- [ ] **Add technical indicators**: Implement RSI(14), 20MA calculation for strategies
-- [ ] **Add macro indicators**: Fetch VIX, SPY vs 200MA, yield spreads for regime detection
-- [ ] **Accept dynamic ticker list**: No hardcoded watchlists, accept from discovery.py
-- [ ] **Discovery mode support**: Fetch sector ETF data when is_premarket=True
-- [ ] **Efficient batch fetching**: Use yfinance efficiently for multiple tickers
-- [ ] **Error handling**: Graceful failures for individual ticker fetch problems
+---
 
-### fetchers/aggregator.py
-- [ ] **Discovery integration**: Update to work with discovery_context instead of watchlist
-- [ ] **Remove watchlist parameter**: Replace with dynamic ticker list from discovery
-- [ ] **Waterfall enhancement**: Ensure all enrichment steps work with discovery mode
-- [ ] **Deduplication improvements**: Handle discovery mode article volumes efficiently
-- [ ] **Error handling**: Don't crash discovery pipeline on aggregation failures
+## Priority 2 — Full Stubs
+*Files that exist but contain no real logic. All functions are `pass` or
+`raise NotImplementedError`.*
+
+### fetchers/market.py — STUB
+- [ ] Fetch price, volume, 50MA, 200MA, RSI(14) per ticker via yfinance
+- [ ] Fetch VIX (`^VIX`) for regime detection
+- [ ] Fetch SPY price vs SPY 200MA
+- [ ] Fetch 10yr-2yr yield spread
+- [ ] Accept dynamic ticker list (no hardcoded tickers)
+- [ ] Return dict keyed by ticker + separate macro indicators dict
+
+### fetchers/aggregator.py — STUB
+- [ ] Merge Marketaux + NewsAPI outputs
+- [ ] Deduplicate by URL exact match
+- [ ] Deduplicate by title similarity > 80%
+- [ ] 4-step waterfall enrichment for NewsAPI articles (Polygon → Alpaca News → scraper → snippet)
+- [ ] Return unified list sorted by `published_at` descending
+
+### engine/sentiment.py — STUB
+- [ ] Marketaux items: pass `sentiment_score` directly, skip Claude
+- [ ] NewsAPI items: send `full_text` (not headline) to Claude
+- [ ] Never send raw headlines to Claude
+- [ ] Truncate text to 1200 words before Claude call
+- [ ] Return sentiment score -1.0 to 1.0 per ticker per article
+- [ ] Tag sentiment with source for feedback loop attribution
+
+### engine/strategies.py — STUB
+- [ ] `momentum_signal()`: BUY if price > 20MA > 50MA, SELL if price < 20MA < 50MA
+- [ ] `mean_reversion_signal()`: BUY if RSI < 30 on green day, SELL if RSI > 70 on red day
+- [ ] `ma_crossover_signal()`: BUY if 20MA crosses above 50MA, SELL if crosses below
+- [ ] `volume_surge_signal()`: BUY if volume > 1.5x avg + price up, SELL if surge + price down
+- [ ] Each strategy returns `{signal, confidence, strategy, reason}`
+- [ ] Confidence scales with signal strength (MA crossover fixed at 0.8, others variable)
+
+### engine/regime.py — STUB
+- [ ] Classify regime as `risk_on`, `risk_off`, or `neutral`
+- [ ] Risk-on: VIX < 20, SPY > 200MA, yield spread > 0.5%
+- [ ] Risk-off: VIX > 25, SPY < 200MA, yield spread < -0.5%
+- [ ] Macro sentiment from NewsAPI articles can override neutral → risk_off
+- [ ] Return `{regime, vix, spy_vs_200ma, yield_spread, macro_sentiment, confidence}`
+
+### engine/combiner.py — STUB
+- [ ] Collect all strategy signals per ticker
+- [ ] Read learned weights from Turso `weights` table
+- [ ] Apply regime modifier (risk_on: SELL -20%, risk_off: BUY -30%)
+- [ ] Include sentiment as separate signal with learned weight
+- [ ] BUY threshold > 0.55, SELL threshold < 0.45, HOLD between
+- [ ] Return `{ticker, signal, confidence, components, regime, rationale}` per ticker
+
+### risk/manager.py — STUB
+- [ ] Position size = risk_amount / (entry_price - stop_loss_price), capped at 500 shares
+- [ ] BUY stop = entry_price × 0.97, SELL stop = entry_price × 1.03
+- [ ] BUY take profit = entry_price × 1.03, SELL take profit = entry_price × 0.97
+- [ ] Hard rule: total portfolio allocation ≤ 80%
+- [ ] Hard rule: single ticker max 10% of portfolio
+- [ ] Hard rule: single sector max 30% of portfolio
+- [ ] Hard rule: no penny stocks (price < $5)
+- [ ] Hard rule: no micro-caps (market cap < $1B)
+- [ ] Hard rule: max 15 open positions
+- [ ] Hard rule: no duplicate signals on same ticker within 2 hours
+- [ ] Sector lookup queries Turso `sector_cache`, fetches via yfinance if missing
+- [ ] Return `{approved, reason, position_size, shares, entry_price, stop_loss, take_profit, portfolio_allocation_pct}`
+
+### executor/alpaca.py — STUB
+- [ ] Check market hours before any order submission
+- [ ] Submit limit order at entry_price + 0.1% slippage buffer
+- [ ] Bracket order (stop loss + take profit) or separate stop order after fill
+- [ ] Return `{order_id, symbol, filled_price, shares}` on success
+- [ ] On failure: return error, do NOT retry in same cycle
+- [ ] Check circuit breaker status before placing any order
+
+### feedback/logger.py — STUB
+- [ ] `log_trade()` writes to Turso `trades` table
+- [ ] Log all 15 required fields including `strategies_fired` and `article_urls` as JSON arrays
+
+### feedback/outcomes.py — STUB
+- [ ] Fetch current price from yfinance for each open trade
+- [ ] Calculate return: (current_price - entry_price) / entry_price
+- [ ] Close position if stop loss or take profit hit
+- [ ] Classify: WIN (> +1%), LOSS (< -1%), NEUTRAL (between)
+- [ ] Write to Turso `outcomes` table
+
+### feedback/weights.py — STUB
+- [ ] WIN: `new_weight = old_weight * 0.95 + 1.0 * 0.05`
+- [ ] LOSS: `new_weight = old_weight * 0.95 + 0.0 * 0.05`
+- [ ] Clamp weight between 0.1 and 1.0
+- [ ] Update weights for strategy that fired and news source
+- [ ] Circuit breaker: rolling 7-day win rate check
+- [ ] Trip if win rate < 40%, send email/Slack alert, set `tripped=True` in Turso
+
+### scheduler/loop.py — STUB
+- [ ] Primary job: every 15 minutes during market hours (9:30 AM–4:00 PM ET)
+- [ ] Pre-market job: 9:00 AM ET
+- [ ] Post-market job: 4:30 PM ET
+- [ ] Weekend/holiday skip
+- [ ] `is_market_open()` checks Alpaca calendar API
+- [ ] Circuit breaker check before each trading cycle
+- [ ] Discovery runs as first step in each cycle
+- [ ] Log each cycle: timestamp, tickers scanned, signals generated, orders placed
+
+### dashboard/app.py — STUB
+- [ ] Portfolio overview: cash, positions, total value, daily P&L
+- [ ] Trade history table with signal metadata, outcome, return
+- [ ] Active tickers panel: tickers this cycle + discovery source per ticker
+- [ ] Signal feed with confidence and strategy breakdown
+- [ ] Weight table from Turso
+- [ ] Regime indicator with VIX, SPY vs 200MA, yield spread
+- [ ] Sector exposure pie chart
+- [ ] Circuit breaker status with manual override button
+- [ ] Win rate chart with 40% threshold line
+- [ ] Settings panel: TICKER_MODE, WATCHLIST, MAX_DISCOVERY_TICKERS
+
+---
+
+## Priority 3 — Missing Files
+*Files that do not exist at all.*
+
+- [ ] Create `db/client.py` — Turso connection manager (`get_db()` returning libsql_client sync client)
+- [ ] Create `db/schema.sql` — all 6 tables: trades, outcomes, weights, circuit_breaker, sector_cache, discovery_log
+
+---
+
+## Priority 4 — Architectural Violations
+*Files that violate CLAUDE.md hard rules. These must be fixed regardless of implementation phase.*
+
+### fetchers/discovery.py
+- [ ] **VIOLATION** (line 98): `SP500_TICKERS = [...]` — hardcoded list of 50 tickers violates "NEVER hardcode ticker lists in any module except discovery.py... all downstream modules receive tickers dynamically." The tickers must come from dynamic yfinance scans and news extraction, not a static list.
+- [ ] **VIOLATION** (line 110): `SECTOR_ETF_HOLDINGS = {...}` — hardcoded sector holdings dict. Top 3 holdings per ETF must be fetched from yfinance at runtime, not hardcoded.
+- [ ] **VIOLATION** (line 461): `sample_tickers = SP500_TICKERS[:20]` — discovery falls back to a static 20-ticker sample, undermining the entire dynamic discovery architecture.
 
 ### fetchers/polygon.py
-- [ ] **Remove hardcoded watchlist**: Line 16 has DEFAULT_WATCHLIST - violates architecture
-- [ ] **Accept dynamic ticker list**: All ticker filtering should come from discovery.py
-- [ ] **Discovery mode support**: Add broad fetching capability for discovery engine
-- [ ] **Rate limiting integration**: Coordinate with other fetchers to avoid API overload
-- [ ] **Turso caching**: Replace any local caching with database storage
-
-### fetchers/alpaca_news.py
-- [ ] **Accept dynamic ticker list**: Remove hardcoded watchlist dependencies
-- [ ] **Discovery integration**: Support broad mode fetching for discovery engine
-- [ ] **Error handling**: Graceful degradation when Alpaca News unavailable
-- [ ] **Integration with waterfall**: Ensure it works properly in aggregator waterfall
-
-### engine/sentiment.py
-- [ ] **Remove aggregator import**: Line 6 imports from old aggregator interface
-- [ ] **Discovery integration**: Accept dynamic ticker list, not hardcoded
-- [ ] **Turso integration**: Replace any local storage with database calls
-- [ ] **Regime classification**: Add macro sentiment analysis for regime.py integration
-- [ ] **Attribution tracking**: Tag sentiment with source for feedback loop
-- [ ] **Error handling**: Don't crash on individual sentiment analysis failures
-- [ ] **Claude API optimization**: Batch requests efficiently, handle rate limits
-
-### engine/signals.py
-- [ ] **DEPRECATED**: Replace entirely with engine/combiner.py
-- [ ] **Migration strategy**: Move any reusable logic to engine/strategies.py
-- [ ] **Remove references**: Update any imports from other modules
-- [ ] **Historical compatibility**: Ensure old signal format can be migrated
-
-### executor/alpaca.py
-- [ ] **Risk manager integration**: ALL trades must go through risk/manager.py first
-- [ ] **Market hours checking**: Integrate with scheduler's market hours awareness
-- [ ] **Position tracking**: Provide current positions to risk manager and discovery
-- [ ] **Stop loss/take profit**: Implement bracket orders or separate order management
-- [ ] **Order metadata**: Track order IDs for feedback loop correlation
-- [ ] **Error handling**: Comprehensive error handling for order failures
-- [ ] **Circuit breaker integration**: Check circuit breaker status before any trade
+- [ ] **VIOLATION** (line 16): `DEFAULT_WATCHLIST = ['AAPL', 'MSFT', 'NVDA', ...]` — hardcoded ticker list used as default in `_fetch_general_news()` at line 47. This module is not in the CLAUDE.md architecture — evaluate whether it's needed or should be removed.
 
 ### dashboard/app.py
-- [ ] **Import updates**: Line 4-6 import from old module structure
-- [ ] **Discovery integration**: Add active tickers panel showing discovery results
-- [ ] **Regime indicator**: Show current market regime with technical inputs
-- [ ] **Weight visualization**: Display learned strategy and source weights
-- [ ] **Circuit breaker status**: Show system halt status with manual override
-- [ ] **Sector exposure**: Add pie chart of portfolio allocation by sector
-- [ ] **Performance metrics**: Rolling win rate, drawdown tracking
-- [ ] **Settings panel**: Toggle TICKER_MODE, edit MAX_DISCOVERY_TICKERS
-- [ ] **Turso integration**: All data queries should hit database, not local files
-- [ ] **Real-time updates**: Integrate with scheduler for live cycle status
-
-### test_newsapi.py
-- [ ] **Update test parameters**: Add broad mode testing
-- [ ] **Discovery integration**: Test discovery_context parameter handling
-- [ ] **Mocking strategy**: Mock Turso database calls appropriately
-- [ ] **Error handling tests**: Verify graceful degradation on API failures
-- [ ] **Rate limiting tests**: Ensure tests don't hit real API rate limits
-
-### test_polygon.py  
-- [ ] **Remove hardcoded watchlists**: Replace with dynamic test data
-- [ ] **Discovery integration**: Test broad mode fetching
-- [ ] **Rate limiting tests**: Ensure tests respect API limits
-- [ ] **Error handling**: Test failure modes don't crash system
+- [ ] **VIOLATION** (line 5): `from engine import signals` — imports from the deprecated `engine/signals.py` module which is superseded by `engine/combiner.py` and `engine/strategies.py`. Will cause import errors once `engine/signals.py` is deleted.
 
 ---
 
-## Database Migration Requirements
+## Deprecated
+*Files that should be deleted.*
 
-### Turso Integration Needed In:
-- [ ] **All fetchers**: Replace any local caching with Turso sector_cache, discovery_log
-- [ ] **Sentiment engine**: Cache sentiment analysis results, track attribution
-- [ ] **Risk manager**: Query sector_cache, log risk decisions
-- [ ] **Dashboard**: All data visualization should query Turso tables
-- [ ] **Test files**: Mock database connections appropriately
-
-### Missing Database Operations:
-- [ ] **db/client.py**: Implement Turso connection manager (referenced but missing)
-- [ ] **Schema initialization**: Implement schema.sql table creation
-- [ ] **Connection pooling**: Efficient database connection management
-- [ ] **Error handling**: Database failure graceful degradation
-- [ ] **Migration scripts**: Handle schema updates and data migration
+- [ ] Delete `engine/signals.py` — superseded by `engine/combiner.py` and `engine/strategies.py`
+  - [x] Confirmed no other file imports from it (grep found no `from engine.signals` or `import engine.signals` in any module — only `dashboard/app.py` uses `from engine import signals` which is the violation above)
 
 ---
 
-## Performance and Reliability Issues
+## Complete — No Action Needed
 
-### API Rate Limiting:
-- [ ] **Coordinate fetchers**: Prevent simultaneous API calls that exceed limits
-- [ ] **Backoff strategies**: Exponential backoff for failed API calls
-- [ ] **Circuit breakers**: API-level circuit breakers for external service failures
-- [ ] **Caching strategy**: Aggressive caching to minimize API usage
-
-### Error Recovery:
-- [ ] **Partial failures**: System continues operating with degraded data
-- [ ] **Retry logic**: Smart retries for transient failures
-- [ ] **Fallback data**: Use cached/stale data when fresh data unavailable
-- [ ] **Monitoring**: Comprehensive logging for debugging and alerting
-
-### Memory Management:
-- [ ] **Large dataset handling**: Efficiently process high-volume news in discovery mode
-- [ ] **Resource cleanup**: Proper cleanup of network connections and data structures
-- [ ] **Memory limits**: Prevent memory bloat during extended operation
+- `fetchers/newsapi.py` — COMPLETE. Full EventRegistry integration, multi-topic fetching, ticker extraction in discovery mode, watchlist filtering. Sets `needs_full_text=True` for aggregator enrichment.
+- `fetchers/scraper.py` — COMPLETE. Full 3-tier fallback (trafilatura → newspaper3k → BeautifulSoup), paywall detection, 1200-word truncation, `{full_text, partial}` return shape.
 
 ---
 
-## Configuration Management
+## Implementation Phases
 
-### Environment Variables:
-- [ ] **Turso configuration**: Add TURSO_CONNECTION_URL and TURSO_AUTH_TOKEN usage
-- [ ] **Discovery parameters**: Implement MAX_DISCOVERY_TICKERS throughout system
-- [ ] **Alert configuration**: Implement ALERT_EMAIL and SLACK_WEBHOOK_URL
-- [ ] **Validation**: Startup validation of all required configuration
+### Phase 1 — Foundation (nothing else works without these)
+1. `db/client.py` — Turso connection manager
+2. `db/schema.sql` — all 6 tables
 
-### Settings Integration:
-- [ ] **Dynamic configuration**: Support runtime configuration changes via dashboard
-- [ ] **Configuration persistence**: Store user preferences in database
-- [ ] **Validation**: Validate configuration changes don't break system
+### Phase 2 — Data Pipeline
+3. `fetchers/market.py` — price, volume, RSI, MAs, VIX, yield spread
+4. `fetchers/discovery.py` — fix hardcoded violations, implement dynamic yfinance discovery
+5. `fetchers/aggregator.py` — merge + 4-step waterfall enrichment
+6. Fix `fetchers/marketaux.py` — honor the `broad` parameter
 
----
+### Phase 3 — Signal Engine
+7. `engine/strategies.py` — all 4 strategies
+8. `engine/regime.py` — macro regime classifier
+9. `engine/combiner.py` — weighted signal combiner with Turso weight reads
+10. `engine/sentiment.py` — Claude sentiment integration
 
-## Security and Compliance
+### Phase 4 — Execution + Risk
+11. `risk/manager.py` — all 7 hard rules + position sizing + sector cache
+12. `executor/alpaca.py` — paper order placement with bracket orders
 
-### API Key Management:
-- [ ] **Secure storage**: Ensure API keys never logged or exposed
-- [ ] **Rotation support**: Handle API key rotation gracefully
-- [ ] **Access control**: Proper scoping of API permissions
+### Phase 5 — Feedback Loop
+13. `feedback/logger.py` — trade logging to Turso
+14. `feedback/outcomes.py` — outcome measurement
+15. `feedback/weights.py` — EMA weight updates + circuit breaker
 
-### Data Privacy:
-- [ ] **Personal data**: Ensure no personal information collected from news sources
-- [ ] **Data retention**: Implement appropriate data retention policies
-- [ ] **Audit trails**: Comprehensive audit logging for regulatory compliance
+### Phase 6 — Orchestration + UI
+16. `scheduler/loop.py` — full APScheduler event loop
+17. `dashboard/app.py` — complete Streamlit UI, fix deprecated import
 
----
-
-## Testing Requirements
-
-### Integration Tests Needed:
-- [ ] **End-to-end pipeline**: Full discovery → analysis → execution → feedback cycle
-- [ ] **Database integration**: All Turso operations with test database
-- [ ] **API failure scenarios**: Test system behavior under various failure modes
-- [ ] **Performance testing**: System behavior under high-volume news cycles
-- [ ] **Circuit breaker testing**: Verify automatic halt and recovery mechanisms
-
-### Unit Tests Missing:
-- [ ] **All new modules**: comprehensive unit test coverage for stubs
-- [ ] **Edge cases**: Test boundary conditions and error scenarios
-- [ ] **Mocking strategy**: Consistent mocking of external dependencies
-
----
-
-## Documentation Updates
-
-### Missing Documentation:
-- [ ] **Setup instructions**: Complete setup with Turso database initialization
-- [ ] **Configuration guide**: All environment variables and their purposes
-- [ ] **Troubleshooting**: Common issues and resolution steps
-- [ ] **Architecture diagrams**: Updated diagrams showing new data flow
-- [ ] **API documentation**: Document internal module interfaces
-
-### Code Documentation:
-- [ ] **Inline comments**: Add comments to complex logic in existing modules
-- [ ] **Function documentation**: Ensure all public functions have proper docstrings
-- [ ] **Example usage**: Add usage examples to complex modules
-
----
-
-## Priority Implementation Order
-
-Based on dependencies and criticality:
-
-### Phase 1 (Critical Foundation):
-1. **db/client.py** - Database connection manager
-2. **fetchers/market.py** - Technical indicator implementation
-3. **engine/sentiment.py** - Fix imports and discovery integration
-
-### Phase 2 (Core Pipeline):
-4. **executor/alpaca.py** - Risk manager integration
-5. **fetchers/aggregator.py** - Discovery mode support
-6. **Remove engine/signals.py** - Deprecated module cleanup
-
-### Phase 3 (User Interface):
-7. **dashboard/app.py** - Complete UI overhaul for new architecture
-8. **test_*.py files** - Update test suite
-9. **Documentation** - Complete setup and usage documentation
-
-### Phase 4 (Optimization):
-10. **Performance optimization** - Rate limiting, caching, error handling
-11. **Security hardening** - API key management, data privacy
-12. **Monitoring and alerting** - Comprehensive system monitoring
+### Cleanup
+18. Delete `engine/signals.py`
+19. Fix or remove `fetchers/polygon.py` (not in CLAUDE.md architecture, has hardcoded watchlist)

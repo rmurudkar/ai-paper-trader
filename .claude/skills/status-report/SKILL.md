@@ -10,15 +10,36 @@ description: >
 
 # Status Report
 
-Generate a full status report for the paper trader project. This skill runs the
-integration test suite, reads recent git history, checks which modules from the
-CLAUDE.md implementation priority list exist, cross-references failing tests against
-those modules, and produces a clear picture of where the project stands and what
-to work on next.
+Generate a full status report for the paper trader project. This skill:
+1. Runs a fresh audit of codebase completeness (via the audit skill logic)
+2. Runs the integration test suite
+3. Reads recent git history
+4. Combines all three sources into one report
+5. Produces one specific recommended next step
+
+The audit takes priority — a partially implemented component that blocks the pipeline
+is more urgent than a missing component or a failing test.
 
 ---
 
-## Step 1 — Run the Integration Tests
+## Step 1 — Run the Audit
+
+Execute the full audit logic from the `audit` skill against the current codebase.
+Do not read a cached AUDIT.md — run the audit fresh every time status-report is invoked.
+
+From the audit, extract:
+- List of PARTIAL files (incomplete implementations) with their unchecked items
+- List of STUB files (no logic at all)
+- List of MISSING files
+- List of architectural violations
+- Any deprecated files that still exist (engine/signals.py)
+
+This audit output feeds directly into the report. Do not display it separately —
+fold it into the ARCHITECTURE HEALTH section of the report below.
+
+---
+
+## Step 2 — Run the Integration Tests
 
 Run the full test suite, excluding expensive Claude API tests:
 
@@ -26,205 +47,169 @@ Run the full test suite, excluding expensive Claude API tests:
 pytest tests/ -m "not expensive" -v --tb=short 2>&1
 ```
 
-If the `tests/` directory does not exist yet, skip this step and note in the report
-that no tests have been written yet.
+If the `tests/` directory does not exist, note "No tests written yet" and continue.
+If pytest is not installed, note it and continue.
 
-Capture the full output. Parse it for:
-- Total tests collected
-- Number passed
-- Number failed
-- Number errored (import errors, setup failures)
+Capture:
+- Total tests collected, passed, failed, errored
 - Names of every failing or erroring test function
-- The short traceback for each failure (--tb=short gives the key line)
-
-If pytest is not installed, note that in the report and do not fail — continue with
-the remaining steps.
+- The short traceback for each failure
 
 ---
 
-## Step 2 — Read Recent Git History
+## Step 3 — Read Recent Git History
 
 Run:
 ```
 git log --oneline --since="14 days ago"
-```
-
-List every commit. Group them loosely by what they touch (fetchers, engine, risk, etc.)
-based on the commit message. This is the "last session" summary.
-
-Also run:
-```
 git status
 ```
 
-Note any uncommitted changes — these are in-progress work that hasn't been committed yet.
+Group commits loosely by area (fetchers, engine, risk, etc.) from the commit message.
+Note any uncommitted changes.
 
----
-
-## Step 3 — Check Module Existence Against Implementation Priority
-
-The CLAUDE.md file defines this implementation priority order:
-
-```
-1.  db/client.py
-2.  db/schema.sql
-3.  scheduler/loop.py
-4.  fetchers/discovery.py
-5.  engine/strategies.py
-6.  engine/regime.py
-7.  engine/combiner.py
-8.  risk/manager.py
-9.  feedback/logger.py
-10. feedback/outcomes.py
-11. feedback/weights.py
-12. dashboard/app.py
-```
-
-Additionally check for the fetcher modules that are required before the engine runs:
-```
-fetchers/marketaux.py
-fetchers/newsapi.py
-fetchers/scraper.py
-fetchers/market.py
-fetchers/aggregator.py
-executor/alpaca.py
-```
-
-For each file, check whether it exists. Mark each as:
-- EXISTS — file is present
-- MISSING — file has not been created yet
-- STUB — file exists but appears to be a placeholder (< 20 lines of actual logic)
-
-A STUB is when the file exists but the key functions are not implemented (e.g., the
-function exists but has only `pass` or `raise NotImplementedError`). Read the file
-briefly to make this determination.
+If `.claude/last-status.md` exists, read it. Note any tests that are still failing
+from the previous session — these are recurring issues that need to be explicitly called out.
 
 ---
 
 ## Step 4 — Cross-Reference Tests with Modules
 
-For each module that EXISTS or is a STUB, check whether a corresponding test file
-exists in the `tests/` directory.
+For each module that exists (PARTIAL, STUB, or complete), check whether a corresponding
+test file exists in `tests/`.
 
-For each test file that exists, look up how many tests it contains and how many
-passed vs failed in Step 1.
+Build a table combining audit status and test results:
 
-Produce a mapping like:
+| Module                  | Audit Status | Test File | Tests | Pass | Fail |
+|-------------------------|--------------|-----------|-------|------|------|
+| db/client.py            | MISSING      | —         |  —    |  —   |  —   |
+| fetchers/marketaux.py   | PARTIAL      | MISSING   |  —    |  —   |  —   |
+| engine/combiner.py      | STUB         | EXISTS    |   5   |   2  |   3  |
 
-| Module              | Status  | Test File           | Tests | Pass | Fail |
-|---------------------|---------|---------------------|-------|------|------|
-| db/client.py        | EXISTS  | tests/db/test_client.py | 3  |  3   |  0   |
-| engine/combiner.py  | EXISTS  | tests/engine/test_combiner.py | 5 | 3 | 2 |
-| engine/regime.py    | STUB    | MISSING             |  —    |  —   |  —   |
-| risk/manager.py     | MISSING | MISSING             |  —    |  —   |  —   |
+Audit Status values: COMPLETE / PARTIAL / STUB / MISSING
 
 ---
 
-## Step 5 — Diagnose Failing Tests
+## Step 5 — Determine Recommended Next Step
 
-For each failing test, read the short traceback from pytest output and determine:
+Use audit results and test failures together to determine ONE specific next step.
 
-- Is this a real bug in the module logic?
-- Is this a missing module (ImportError because the module doesn't exist yet)?
-- Is this a real API connectivity issue (network, missing key)?
-- Is this a DB state issue (stale test data from a previous run)?
+Priority order (highest first):
 
-Summarize each failure in one sentence. Do not go deep into debugging here — the goal
-is to surface what needs attention, not fix everything at once.
+1. **Architectural violation** — fix before anything else. A violation means the
+   system will behave incorrectly even after implementation. Example: hardcoded
+   tickers in discovery.py means the discovery module will never work dynamically.
 
----
+2. **Failing tests on a PARTIAL or COMPLETE module** — a test found a real bug in
+   existing logic. Fix the module, then re-run tests.
 
-## Step 6 — Determine Next Step
+3. **PARTIAL module that is next in implementation phase order** — incomplete
+   implementations are worse than stubs because they create false confidence.
+   Complete it before building the next module.
 
-Using everything gathered above, determine ONE recommended next step. Priority order:
+4. **STUB module that is next in phase order** — build the next unimplemented module.
 
-1. If there are failing tests for an existing module → fix the module (the test found
-   a real bug).
-2. If a module is a STUB and it's the next item in implementation priority order →
-   implement it.
-3. If a module is MISSING and it's next in implementation priority order → build it.
-4. If all modules exist and all tests pass → write tests for any modules that are
-   missing test coverage.
-5. If tests are missing entirely → run the test-writer skill on the first untested module.
+5. **MISSING module that is next in phase order** — create the missing file.
 
-Be specific. Don't say "work on the engine". Say "Implement engine/combiner.py —
-regime modifier math and threshold logic are not yet built (engine/combiner.py is a
-stub with no combiner logic)."
+6. **Module with no test coverage** — write tests using the test-writer skill.
+
+Be specific. Name the file and what exactly needs to be done. Example:
+"Complete `fetchers/discovery.py` — the dynamic news-driven discovery and market
+mover scan are not implemented (hardcoded SP500_TICKERS list violates architecture).
+This blocks the entire pipeline since all downstream modules receive their ticker
+list from discovery."
 
 ---
 
-## Step 7 — Format and Output the Report
-
-Output the report using this exact format:
+## Step 6 — Format and Output the Report
 
 ```
-═══════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════════
 PAPER TRADER — SESSION STATUS REPORT
 Generated: <current date and time>
-═══════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════════
 
 ## LAST SESSION (git history, past 14 days)
 
-<bullet list of commits, grouped loosely by area>
+<bullet list of commits grouped by area>
 
 Uncommitted changes: <list files, or "none">
 
-───────────────────────────────────────────────────────────
+<If previous .claude/last-status.md exists and has recurring failures:>
+⚠ Still failing from last session: <test names>
+
+───────────────────────────────────────────────────────────────────
+
+## ARCHITECTURE HEALTH
+
+Incomplete implementations (PARTIAL):  X
+Full stubs (no logic):                 X
+Missing files:                         X
+Architectural violations:              X
+Deprecated (should be deleted):        X
+
+### Incomplete — Needs Completion First
+<For each PARTIAL file, list only the unchecked items from the audit:>
+• fetchers/discovery.py (PARTIAL)
+  - [ ] Dynamic news-driven discovery not implemented (SP500_TICKERS hardcoded)
+  - [ ] Market movers scan not implemented
+  - [ ] Sector rotation scan not implemented
+
+### Stubs — Awaiting Implementation
+<Group by phase:>
+Phase 1 (Foundation): db/client.py, db/schema.sql
+Phase 2 (Data Pipeline): fetchers/market.py, fetchers/aggregator.py
+...
+
+### Architectural Violations
+<If any:>
+• fetchers/discovery.py — hardcoded SP500_TICKERS list violates "never hardcode
+  tickers outside discovery.py" rule. Dynamic yfinance fetching required.
+<If none:>
+  No violations detected.
+
+### Deprecated Files Still Present
+<If any:>
+• engine/signals.py — superseded by engine/combiner.py and engine/strategies.py.
+  Confirm no imports, then delete.
+
+───────────────────────────────────────────────────────────────────
 
 ## TEST HEALTH
 
-Total tests run: X  |  Passed: X  |  Failed: X  |  Errors: X
-(Excludes @pytest.mark.expensive tests — Claude API calls)
+Total: X  |  Passed: X  |  Failed: X  |  Errors: X
+(Skipped: @pytest.mark.expensive — Claude API tests)
 
-| Module                  | Status  | Tests | Pass | Fail |
-|-------------------------|---------|-------|------|------|
-| db/client.py            | EXISTS  |   3   |   3  |   0  |
-| engine/combiner.py      | EXISTS  |   5   |   3  |   2  |
-| engine/regime.py        | STUB    |   —   |   —  |   —  |
+| Module                  | Audit Status | Tests | Pass | Fail |
+|-------------------------|--------------|-------|------|------|
+| fetchers/marketaux.py   | PARTIAL      |   4   |   3  |   1  |
+| engine/regime.py        | STUB         |   —   |   —  |   —  |
 ...
 
-───────────────────────────────────────────────────────────
-
-## FAILING TESTS
-
+### Failing Tests
 <For each failure:>
 • test_<name> (tests/<path>): <one-sentence diagnosis>
 
-If none: "All tests passing."
+<If none:> All tests passing.
 
-───────────────────────────────────────────────────────────
-
-## IMPLEMENTATION GAPS
-
-Modules not yet built or stubbed (from CLAUDE.md priority list):
-• <list each MISSING or STUB module>
-
-Modules with no test coverage:
-• <list each module that exists but has no test file>
-
-───────────────────────────────────────────────────────────
+───────────────────────────────────────────────────────────────────
 
 ## RECOMMENDED NEXT STEP
 
-<One clear, specific action. Name the file, describe what needs to be done,
-and explain why it's the highest priority right now.>
+<One specific action. Name the file, what needs to be done, and why it's
+the highest priority. Reference the audit violation or stub status.>
 
-═══════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════════
 ```
 
 ---
 
-## Step 8 — Save the Report
+## Step 7 — Write AUDIT.md and Save Report
 
-After outputting the report to the user, save a copy to:
-```
-.claude/last-status.md
-```
+After displaying the report:
 
-Overwrite any previous version. This file allows the next session's status-report
-run to compare current state against last session's state — if the same test is
-failing two sessions in a row, that is worth flagging explicitly.
+1. Write the full audit output (from Step 1) to `AUDIT.md` in the project root,
+   using the format defined in the audit skill. Overwrite any previous version.
 
-If a previous `.claude/last-status.md` exists, read it before generating the new
-report. Add a note under "LAST SESSION" if any previously failing tests are still
-failing — that indicates a known issue that hasn't been addressed.
+2. Save the status report to `.claude/last-status.md`. Overwrite any previous version.
+   This enables the next session to detect recurring failures.

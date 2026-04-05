@@ -4,6 +4,9 @@ yfinance
 requests
 trafilatura
 newspaper3k
+beautifulsoup4
 streamlit
 plotly
 python-dotenv
+libsql-client
+apscheduler

@@ -81,6 +81,7 @@ import yfinance as yf
 # Import existing fetchers
 from .marketaux import fetch_news as fetch_marketaux
 from .newsapi import fetch_headlines as fetch_newsapi
+from .market import fetch_sp500_tickers
 
 # Load environment variables
 load_dotenv()
@@ -435,20 +436,9 @@ def _extract_tickers_from_text(text: str) -> Set[str]:
 def _get_market_movers(db_path: str) -> Dict[str, List[str]]:
     """Get today's top gainers and losers from S&P 500.
 
-    Implementation Details:
-    ----------------------
-    - Uses static S&P 500 ticker list (subset for performance)
-    - Fetches 2-day price history via yfinance to calculate daily change %
-    - Sorts by change percentage (high to low)
-    - Returns top 5 gainers and bottom 5 (losers)
-    - Handles individual ticker failures gracefully
-    - In production would use full S&P 500 list or dynamic screener
-
-    Performance Notes:
-    -----------------
-    - Currently uses first 20 SP500 tickers for demo purposes
-    - Each yfinance call can take 100-500ms, so batching is important
-    - Results could be cached for intraday reuse
+    Uses fetch_sp500_tickers() to dynamically fetch the full S&P 500 list,
+    then calculates daily change % via yfinance batch download to find the
+    top 5 gainers and bottom 5 losers.
 
     Returns:
         Dict with 'gainers' and 'losers' keys, each containing list of 5 ticker symbols
@@ -457,17 +447,26 @@ def _get_market_movers(db_path: str) -> Dict[str, List[str]]:
         # Get price data for S&P 500 tickers
         movers_data = []
 
-        # Use a subset for performance (in production would use full SP500)
-        sample_tickers = SP500_TICKERS[:20]  # Use first 20 for demo
+        # Dynamically fetch full S&P 500 list (falls back to static list on failure)
+        sp500 = fetch_sp500_tickers()
+        logger.info(f"Scanning {len(sp500)} S&P 500 tickers for market movers")
 
-        for ticker in sample_tickers:
+        # Batch download 2-day history for all tickers at once
+        data = yf.download(sp500, period='2d', group_by='ticker', auto_adjust=True, threads=True)
+
+        for ticker in sp500:
             try:
-                stock = yf.Ticker(ticker)
-                hist = stock.history(period='2d')  # Get 2 days to calculate change
+                if len(sp500) == 1:
+                    hist = data
+                else:
+                    if ticker not in data.columns.get_level_values(0):
+                        continue
+                    hist = data[ticker]
 
-                if len(hist) >= 2:
-                    today_close = hist['Close'].iloc[-1]
-                    yesterday_close = hist['Close'].iloc[-2]
+                close = hist['Close'].dropna()
+                if len(close) >= 2:
+                    today_close = float(close.iloc[-1])
+                    yesterday_close = float(close.iloc[-2])
                     change_pct = ((today_close - yesterday_close) / yesterday_close) * 100
 
                     movers_data.append({

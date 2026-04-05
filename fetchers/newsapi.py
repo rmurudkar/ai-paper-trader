@@ -375,8 +375,8 @@ def _parse_articles(response_json: Dict, topic_name: str) -> List[Dict]:
             'published_at': published_at,
             'source': 'newsapi',
             'needs_full_text': True,
-            'tickers': [],  # Will be populated by _enhance_articles_with_tickers in discovery mode
-            'extraction_confidence': 0.0  # Will be populated by _enhance_articles_with_tickers in discovery mode
+            'tickers': [],
+            'extraction_confidence': 0.0
         })
 
     return articles

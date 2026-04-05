@@ -61,7 +61,6 @@ def fetch_news(tickers: List[str] = None, max_results: int = 20, broad: bool = F
         # Generate yesterday's date for filtering recent articles
         published_after = _get_published_after()
 
-        # TODO: implement broad mode filtering
         # Build API parameters based on mode
         if ticker_mode == 'discovery':
             # Discovery mode: fetch broad news, no ticker filter
