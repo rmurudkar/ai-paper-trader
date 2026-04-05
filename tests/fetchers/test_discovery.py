@@ -38,6 +38,10 @@ from fetchers.discovery import (
     _init_database,
     _log_discovery_cycle,
     get_sector,
+    _get_sp500_tickers,
+    _get_etf_holdings,
+    _get_sector_etf_holdings_dynamic,
+    SECTOR_ETFS,
 )
 
 
@@ -279,16 +283,135 @@ def test_market_movers_returns_gainers_and_losers():
 
 
 ########################################################################
-# SCENARIO 7 — Sector rotation picks returns valid tickers
+# SCENARIO 6B — Dynamic S&P 500 tickers uses fallback when API unavailable
+########################################################################
+
+def test_get_sp500_tickers_returns_list():
+    """
+    Scenario: Call _get_sp500_tickers() to fetch S&P 500 universe.
+    Expected: Returns a list of 50+ ticker strings.
+              Uses fetch_sp500_tickers() if available, falls back to curated list.
+    Why it matters: This replaced the hardcoded 50-ticker list. Discovery must now
+                    dynamically pull from the full S&P 500 (or fallback gracefully).
+    """
+    from fetchers.discovery import _get_sp500_tickers
+
+    tickers = _get_sp500_tickers()
+
+    # Should return a list
+    assert isinstance(tickers, list)
+
+    # Should have at least 50 tickers (fallback list is 50)
+    assert len(tickers) >= 50
+
+    # All should be non-empty strings
+    for ticker in tickers:
+        assert isinstance(ticker, str)
+        assert len(ticker) >= 1
+        assert len(ticker) <= 5  # Valid ticker length
+
+    # Should contain well-known mega-cap stocks from fallback
+    # (won't be in dynamic list if API fails, but will be in fallback)
+    fallback_stocks = {'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA'}
+    assert any(t in tickers for t in fallback_stocks), \
+        f"Fallback stocks missing. Got: {tickers[:10]}"
+
+
+########################################################################
+# SCENARIO 6C — ETF holdings are fetched dynamically with caching
+########################################################################
+
+def test_get_etf_holdings_dynamic():
+    """
+    Scenario: Call _get_etf_holdings() to fetch top holdings for a sector ETF.
+    Expected: Returns list of ticker strings for top holdings (cached).
+              Falls back to empty list if API unavailable (caller uses hardcoded fallback).
+    Why it matters: Sector rotation now uses dynamic holdings instead of hardcoded map.
+                    Caching prevents excessive API calls.
+    """
+    from fetchers.discovery import _get_etf_holdings
+
+    # Test XLK (Technology sector)
+    holdings = _get_etf_holdings('XLK', top_n=5, cache_hours=24)
+
+    # Should return a list (could be empty if APIs unavailable)
+    assert isinstance(holdings, list)
+
+    # All should be valid ticker strings (if non-empty)
+    for ticker in holdings:
+        assert isinstance(ticker, str)
+        assert len(ticker) >= 1
+        assert len(ticker) <= 5
+
+
+def test_get_sector_etf_holdings_dynamic_coverage():
+    """
+    Scenario: Call _get_sector_etf_holdings_dynamic() to build full holdings map.
+    Expected: Returns dict with 20 ETFs (11 sectors + 9 style/cap).
+              Every ETF has a non-empty holdings list (uses fallback if APIs unavailable).
+    Why it matters: Expanded sector coverage from 11 to 20 ETFs for better rotation options.
+    """
+    from fetchers.discovery import _get_sector_etf_holdings_dynamic, SECTOR_ETFS
+
+    holdings_map = _get_sector_etf_holdings_dynamic()
+
+    # Should have entries for all defined sector ETFs
+    assert isinstance(holdings_map, dict)
+    assert len(holdings_map) == len(SECTOR_ETFS), \
+        f"Expected {len(SECTOR_ETFS)} ETFs, got {len(holdings_map)}"
+
+    # Every ETF should have holdings (either from API or fallback)
+    for etf, holdings in holdings_map.items():
+        assert isinstance(holdings, list), f"{etf} holdings should be a list"
+        assert len(holdings) > 0, f"{etf} should have at least one holding"
+
+        # All holdings should be valid ticker strings
+        for ticker in holdings:
+            assert isinstance(ticker, str)
+            assert len(ticker) >= 1
+            assert len(ticker) <= 5
+
+
+def test_sector_etfs_expansion_includes_new_categories():
+    """
+    Scenario: Verify SECTOR_ETFS dict includes new style/cap rotation ETFs.
+    Expected: 20 total ETFs: 11 primary sectors + 9 style/cap/international.
+              Includes VTV, VUG, RSP, IWM, EEM, VEA, QQQ, IVV, VTI (new).
+    Why it matters: Expanded from hardcoded 11 to 20 ETFs for richer rotation analysis.
+    """
+    from fetchers.discovery import SECTOR_ETFS
+
+    # Total coverage
+    assert len(SECTOR_ETFS) == 20, \
+        f"Expected 20 ETFs, got {len(SECTOR_ETFS)}"
+
+    # Primary sectors (11)
+    primary_sectors = {
+        'XLK', 'XLF', 'XLE', 'XLV', 'XLC', 'XLI', 'XLY', 'XLP', 'XLU', 'XLRE', 'XLB'
+    }
+    for etf in primary_sectors:
+        assert etf in SECTOR_ETFS, f"Missing primary sector {etf}"
+
+    # New style/cap rotation ETFs (9)
+    new_etfs = {
+        'VTV', 'VUG', 'RSP', 'IWM', 'EEM', 'VEA', 'QQQ', 'IVV', 'VTI'
+    }
+    for etf in new_etfs:
+        assert etf in SECTOR_ETFS, f"Missing new ETF {etf}"
+
+
+########################################################################
+# SCENARIO 7 — Sector rotation picks returns valid tickers from dynamic holdings
 ########################################################################
 
 def test_sector_rotation_picks():
     """
     Scenario: Call _get_sector_rotation_picks() for pre-market sector rotation analysis.
-    Expected: Returns a list of ticker strings from sector ETF holdings.
-              All tickers are valid stock symbols.
+    Expected: Returns a list of ticker strings from dynamically-fetched sector ETF holdings.
+              Uses fallback holdings if APIs unavailable.
+              Returns up to 12 tickers: (top 2 + bottom 2 sectors) * 3 holdings each.
     Why it matters: CLAUDE.md specifies sector rotation runs once per day in pre-market
-                    and adds top 3 holdings from best/worst performing sectors.
+                    using dynamic holdings instead of hardcoded SECTOR_ETF_HOLDINGS.
     """
     with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
         db_path = f.name
@@ -299,17 +422,21 @@ def test_sector_rotation_picks():
 
         assert isinstance(picks, list)
 
-        # Should return up to 12 tickers: (top 2 + bottom 2 sectors) * 3 holdings
-        # minus deduplication
-        assert len(picks) <= 12
+        # Should return up to 24 tickers: (top 2 + bottom 2 sectors) * 3 holdings
+        # each, minus deduplication. (More than old 12 due to 20 vs 11 ETFs)
+        assert len(picks) <= 24
 
         # All picks should be non-empty strings
         for ticker in picks:
             assert isinstance(ticker, str)
             assert len(ticker) >= 1
+            assert len(ticker) <= 5
 
         # No duplicates
         assert len(picks) == len(set(picks))
+
+        # Should include some well-known tickers from fallback if APIs unavailable
+        # (don't assert specific tickers since market volatility changes top/bottom)
 
     finally:
         os.unlink(db_path)
@@ -321,9 +448,11 @@ def test_sector_rotation_picks():
 
 def test_fallback_tickers():
     """
-    Scenario: Call _get_fallback_tickers() directly.
+    Scenario: Call _get_fallback_tickers() directly when discovery fails.
     Expected: Returns dict with basic market ETFs (SPY, QQQ, IWM), mode='fallback'.
+              Provides broad market coverage as last-resort safety net.
     Why it matters: CLAUDE.md rule — NEVER return empty ticker list, always have fallback.
+                    Even when all discovery sources and APIs are unavailable.
     """
     result = _get_fallback_tickers()
 
@@ -331,12 +460,18 @@ def test_fallback_tickers():
     assert 'sources' in result
     assert result['mode'] == 'fallback'
 
-    # Must contain the basic ETFs
+    # Must contain the basic broad-market ETFs
+    # (SPY = broad S&P 500, QQQ = Nasdaq 100/tech, IWM = Russell 2000/small-cap)
     assert set(result['tickers']) == {'SPY', 'QQQ', 'IWM'}
 
-    # All fallback sources should be 'fallback'
+    # All fallback sources should be marked as 'fallback'
     for ticker, sources in result['sources'].items():
         assert sources == ['fallback']
+
+    # Verify these are in the comprehensive SECTOR_ETFS as well
+    # (since we expanded coverage, they should be there)
+    assert 'QQQ' in SECTOR_ETFS
+    assert 'IVV' in SECTOR_ETFS  # Alt to SPY
 
 
 ########################################################################

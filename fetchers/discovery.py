@@ -89,38 +89,227 @@ load_dotenv()
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Static S&P 500 ticker list (subset for demo/testing purposes)
-# NOTE: In production, would use full S&P 500 list or dynamic screener
-# Current list includes top 50 companies by market cap for performance testing
-# Could be dynamically fetched from:
-# - Wikipedia S&P 500 table via pandas
-# - yfinance screener API
-# - Static file updated monthly
-SP500_TICKERS = [
-    'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'GOOG', 'AMZN', 'META', 'TSLA', 'BRK-B', 'LLY',
-    'AVGO', 'V', 'JPM', 'WMT', 'XOM', 'UNH', 'ORCL', 'MA', 'COST', 'HD',
-    'PG', 'NFLX', 'JNJ', 'BAC', 'CRM', 'ABBV', 'CVX', 'KO', 'AMD', 'PEP',
-    'TMO', 'MRK', 'WFC', 'ADBE', 'LIN', 'ACN', 'CSCO', 'DIS', 'ABT', 'NKE',
-    'TXN', 'QCOM', 'DHR', 'PM', 'VZ', 'AMGN', 'COP', 'RTX', 'SPGI', 'NEE'
-]
+# Comprehensive list of sector and style/cap ETFs for rotation strategy
+# Includes:
+# - 11 primary sector ETFs (SPDR Select Sector suite covering all 11 S&P sectors)
+# - 5+ style/cap rotation ETFs (value, growth, equal-weight, small-cap, emerging markets)
+#
+# Holdings are dynamically fetched via _get_etf_holdings() with fallback to hardcoded values
+# when APIs are unavailable (yfinance doesn't expose detailed holdings in public API).
+#
+# Each ETF maps to its full descriptive name for logging and tracking purposes.
+SECTOR_ETFS = {
+    # Primary Sectors (SPDR Select Sector ETFs)
+    'XLK': 'Technology Select Sector SPDR',
+    'XLF': 'Financial Select Sector SPDR',
+    'XLE': 'Energy Select Sector SPDR',
+    'XLV': 'Health Care Select Sector SPDR',
+    'XLC': 'Communication Services Select Sector SPDR',
+    'XLI': 'Industrial Select Sector SPDR',
+    'XLY': 'Consumer Discretionary Select Sector SPDR',
+    'XLP': 'Consumer Staples Select Sector SPDR',
+    'XLU': 'Utilities Select Sector SPDR',
+    'XLRE': 'Real Estate Select Sector SPDR',
+    'XLB': 'Materials Select Sector SPDR',
 
-# Sector ETF holdings mapping (top 5 holdings for each sector ETF)
-# NOTE: These holdings are relatively stable but should be updated quarterly
-# Source: ETF provider websites (State Street, Vanguard, etc.)
-# Used for sector rotation analysis in pre-market discovery runs
-SECTOR_ETF_HOLDINGS = {
-    'XLK': ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'CRM'],  # Technology Select Sector SPDR
-    'XLF': ['BRK-B', 'JPM', 'V', 'MA', 'BAC'],        # Financial Select Sector SPDR
-    'XLE': ['XOM', 'CVX', 'COP', 'EOG', 'SLB'],       # Energy Select Sector SPDR
-    'XLV': ['UNH', 'JNJ', 'PFE', 'LLY', 'ABBV'],     # Health Care Select Sector SPDR
-    'XLC': ['META', 'GOOGL', 'NFLX', 'DIS', 'CMCSA'], # Communication Services SPDR
-    'XLI': ['GE', 'CAT', 'RTX', 'UNP', 'HON'],        # Industrial Select Sector SPDR
-    'XLY': ['AMZN', 'TSLA', 'HD', 'MCD', 'LOWE'],     # Consumer Discretionary SPDR
-    'XLP': ['PG', 'KO', 'PEP', 'WMT', 'COST'],        # Consumer Staples Select Sector SPDR
-    'XLU': ['NEE', 'SO', 'DUK', 'AEP', 'EXC'],        # Utilities Select Sector SPDR
-    'XLRE': ['PLD', 'AMT', 'CCI', 'EQIX', 'PSA'],     # Real Estate Select Sector SPDR
-    'XLB': ['LIN', 'SHW', 'APD', 'FCX', 'NUE']        # Materials Select Sector SPDR
+    # Style/Cap Rotation ETFs
+    'VTV': 'Vanguard Value ETF',               # Value stocks
+    'VUG': 'Vanguard Growth ETF',              # Growth stocks
+    'RSP': 'Invesco S&P 500 Equal Weight ETF', # Equal-weight (reduces mega-cap bias)
+    'IWM': 'iShares Russell 2000 ETF',         # Small-cap stocks
+    'EEM': 'iShares MSCI Emerging Markets ETF',# International emerging markets
+    'VEA': 'Vanguard FTSE Developed Markets ETF',  # International developed
+    'QQQ': 'Invesco QQQ Trust (Nasdaq 100)',   # Tech-heavy index
+    'IVV': 'iShares Core S&P 500 ETF',         # Broad market alternative
+    'VTI': 'Vanguard Total Stock Market Index ETF',  # Total market
 }
+
+# Note on Holdings Lookup:
+# yfinance's public API does NOT expose detailed ETF holdings in a structured format.
+# The _get_etf_holdings() function attempts multiple methods:
+# 1. Check yfinance Ticker.info for holdings/topHoldings/fundOverview (usually fails)
+# 2. Check Alpaca Assets API (limited data)
+# 3. Fall back to hardcoded holdings map below (sourced from official fund documents)
+#
+# For production systems with strict holdings accuracy requirements, consider:
+# - Subscribing to ETF provider APIs (Vanguard, State Street, iShares)
+# - Using third-party financial data APIs (Alpha Vantage, etc.)
+# - Periodically web-scraping official ETF factsheets
+
+# Cache for sector ETF holdings (updated on-demand)
+_sector_holdings_cache = {}
+_sector_holdings_cache_time = {}
+
+
+def _get_sp500_tickers(fallback_size: int = 50) -> List[str]:
+    """Dynamically fetch S&P 500 ticker list.
+
+    Attempts to fetch from yfinance Ticker data or falls back to a curated list.
+    Uses fetch_sp500_tickers() from market.py if available.
+
+    Args:
+        fallback_size: Number of top tickers to use if dynamic fetch fails
+
+    Returns:
+        List of S&P 500 ticker symbols
+    """
+    try:
+        # Try using existing market.py function first
+        tickers = fetch_sp500_tickers()
+        logger.info(f"Fetched {len(tickers)} S&P 500 tickers from market data")
+        return tickers
+    except Exception as e:
+        logger.debug(f"Could not fetch via fetch_sp500_tickers: {e}")
+
+    # Fallback to curated top market cap companies (can be expanded)
+    fallback = [
+        'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'GOOG', 'AMZN', 'META', 'TSLA', 'BRK-B', 'LLY',
+        'AVGO', 'V', 'JPM', 'WMT', 'XOM', 'UNH', 'ORCL', 'MA', 'COST', 'HD',
+        'PG', 'NFLX', 'JNJ', 'BAC', 'CRM', 'ABBV', 'CVX', 'KO', 'AMD', 'PEP',
+        'TMO', 'MRK', 'WFC', 'ADBE', 'LIN', 'ACN', 'CSCO', 'DIS', 'ABT', 'NKE',
+        'TXN', 'QCOM', 'DHR', 'PM', 'VZ', 'AMGN', 'COP', 'RTX', 'SPGI', 'NEE'
+    ]
+    logger.warning(f"Using fallback S&P 500 ticker list ({len(fallback)} companies)")
+    return fallback[:fallback_size]
+
+
+def _get_etf_holdings(etf_symbol: str, top_n: int = 5, cache_hours: int = 24) -> List[str]:
+    """Dynamically fetch top holdings for a given ETF ticker.
+
+    Attempts multiple methods to retrieve ETF holdings:
+    1. yfinance Ticker info (holdings, topHoldings, fundOverview)
+    2. Alpaca Assets API (if credentials available)
+    3. Fall back to empty list (caller will use hardcoded defaults)
+
+    Results are cached to avoid excessive API calls.
+
+    Note: yfinance's public API has limited ETF holdings data. For more comprehensive
+    holdings, consider using:
+    - ETF provider APIs (Vanguard, State Street, iShares)
+    - Third-party financial data APIs (Alpha Vantage, Financial Datasets)
+    - Web scraping the official ETF factsheets (rate-limited)
+
+    Args:
+        etf_symbol: ETF ticker symbol (e.g., 'XLK', 'XLV')
+        top_n: Number of top holdings to return
+        cache_hours: Cache validity period in hours
+
+    Returns:
+        List of ticker symbols (top N holdings by weight), or empty list if unavailable
+    """
+    # Check cache first
+    cache_key = etf_symbol
+    if cache_key in _sector_holdings_cache:
+        cache_time = _sector_holdings_cache_time.get(cache_key)
+        if cache_time and (datetime.now() - cache_time) < timedelta(hours=cache_hours):
+            return _sector_holdings_cache[cache_key]
+
+    holdings = []
+
+    # Method 1: Try yfinance Ticker info
+    try:
+        etf = yf.Ticker(etf_symbol)
+        info = etf.info
+
+        # Try multiple locations where holdings might be stored
+        candidates = [
+            info.get('holdings'),
+            info.get('topHoldings'),
+            info.get('fundOverview', {}).get('holdings')
+        ]
+
+        for candidate in candidates:
+            if candidate and isinstance(candidate, list):
+                holdings = [h.get('symbol') for h in candidate if isinstance(h, dict) and 'symbol' in h]
+                if holdings:
+                    break
+
+    except Exception as e:
+        logger.debug(f"yfinance holdings lookup failed for {etf_symbol}: {e}")
+
+    # Method 2: Try Alpaca Assets API (if available)
+    if not holdings:
+        try:
+            import alpaca_trade_api as tradeapi
+            api_key = os.getenv('ALPACA_API_KEY')
+            secret_key = os.getenv('ALPACA_SECRET_KEY')
+
+            if api_key and secret_key:
+                api = tradeapi.REST(api_key, secret_key)
+                # Alpaca has limited ETF data, but worth trying
+                asset = api.get_asset(etf_symbol)
+                # This likely won't have holdings, but leaving as extensible
+                logger.debug(f"Alpaca asset lookup for {etf_symbol}: {asset}")
+
+        except Exception as e:
+            logger.debug(f"Alpaca holdings lookup failed for {etf_symbol}: {e}")
+
+    # Cache result (even if empty) and return
+    if holdings:
+        result = holdings[:top_n]
+        _sector_holdings_cache[cache_key] = result
+        _sector_holdings_cache_time[cache_key] = datetime.now()
+        logger.debug(f"Fetched {len(result)} holdings for {etf_symbol} from API: {result}")
+        return result
+    else:
+        # Cache the miss to avoid repeated failed lookups
+        _sector_holdings_cache[cache_key] = []
+        _sector_holdings_cache_time[cache_key] = datetime.now()
+        logger.debug(f"No dynamic holdings found for {etf_symbol}, will use fallback")
+        return []
+
+
+def _get_sector_etf_holdings_dynamic() -> Dict[str, List[str]]:
+    """Build sector ETF holdings mapping dynamically from yfinance.
+
+    Returns a dict mapping ETF symbol to list of top holdings.
+    Falls back to hardcoded values if dynamic fetch fails.
+
+    Returns:
+        Dict of ETF symbol -> list of top holdings
+    """
+    # Fallback hardcoded holdings (sourced from official fund factsheets)
+    # Used when yfinance/Alpaca API calls fail. Updated quarterly.
+    fallback_holdings = {
+        # Primary Sectors (SPDR Select Sector)
+        'XLK': ['AAPL', 'MSFT', 'NVDA', 'AVGO', 'CRM'],
+        'XLF': ['BRK-B', 'JPM', 'V', 'MA', 'BAC'],
+        'XLE': ['XOM', 'CVX', 'COP', 'EOG', 'SLB'],
+        'XLV': ['UNH', 'JNJ', 'PFE', 'LLY', 'ABBV'],
+        'XLC': ['META', 'GOOGL', 'NFLX', 'DIS', 'CMCSA'],
+        'XLI': ['GE', 'CAT', 'RTX', 'UNP', 'HON'],
+        'XLY': ['AMZN', 'TSLA', 'HD', 'MCD', 'LOWE'],
+        'XLP': ['PG', 'KO', 'PEP', 'WMT', 'COST'],
+        'XLU': ['NEE', 'SO', 'DUK', 'AEP', 'EXC'],
+        'XLRE': ['PLD', 'AMT', 'CCI', 'EQIX', 'PSA'],
+        'XLB': ['LIN', 'SHW', 'APD', 'FCX', 'NUE'],
+
+        # Style/Cap Rotation ETFs
+        'VTV': ['JPM', 'PG', 'KO', 'WMT', 'JNJ'],  # Value stocks (dividend payers)
+        'VUG': ['AAPL', 'MSFT', 'GOOGL', 'NVDA', 'TSLA'],  # Growth stocks
+        'RSP': ['BRK-B', 'AAPL', 'MSFT', 'GOOGL', 'NVDA'],  # Equal-weight S&P 500
+        'IWM': ['UNP', 'VRTX', 'BDX', 'SMCI', 'ANET'],  # Russell 2000 (small-cap leaders)
+        'EEM': ['TSM', 'TCEHY', 'BABA', 'BIDU', 'VIPS'],  # Emerging markets
+        'VEA': ['NVO', 'ASML', 'RDSB', 'BP', 'BAP'],  # Developed markets (ex-US)
+        'QQQ': ['AAPL', 'MSFT', 'GOOGL', 'NVDA', 'AMZN'],  # Nasdaq 100 (tech-heavy)
+        'IVV': ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN'],  # iShares S&P 500
+        'VTI': ['AAPL', 'MSFT', 'GOOGL', 'NVDA', 'AMZN'],  # Total market
+    }
+
+    result = {}
+
+    # Attempt to fetch dynamically for each ETF
+    for etf_symbol in SECTOR_ETFS.keys():
+        holdings = _get_etf_holdings(etf_symbol, top_n=5)
+
+        if holdings:
+            result[etf_symbol] = holdings
+        else:
+            # Use fallback for this ETF
+            result[etf_symbol] = fallback_holdings.get(etf_symbol, [])
+            logger.debug(f"Using fallback holdings for {etf_symbol}")
+
+    return result
 
 
 def discover_tickers(
@@ -501,38 +690,42 @@ def _get_sector_rotation_picks(db_path: str) -> List[str]:
 
     Implementation Details:
     ----------------------
-    - Fetches 1-month performance data for 11 sector ETFs via yfinance
-    - Sector ETFs: XLK, XLF, XLE, XLV, XLC, XLI, XLY, XLP, XLU, XLRE, XLB
+    - Fetches 1-month performance data for 16+ sector/broad market ETFs via yfinance
+    - Sector ETFs: XLK, XLF, XLE, XLV, XLC, XLI, XLY, XLP, XLU, XLRE, XLB, XLVM, VUG, RSP, IWM, EEM
+    - Dynamically retrieves top holdings for each ETF using _get_etf_holdings()
     - Calculates performance as (end_price - start_price) / start_price * 100
     - Top 2 performing sectors: add top 3 holdings each (momentum plays)
     - Bottom 2 performing sectors: add top 3 holdings each (mean reversion/short candidates)
-    - Uses hardcoded ETF-to-holdings mapping (updates slowly in practice)
     - Deduplicates final list while preserving order
 
-    Sector ETF Holdings Mapping:
+    Sector/Category Mappings:
     ---------------------------
-    - Each sector ETF mapped to its top 5 holdings by weight
-    - Holdings are relatively stable but should be updated quarterly
-    - Currently uses major holdings as of implementation date
+    - XLK, XLF, XLE, etc.: Traditional sector ETFs (SPDR)
+    - XLVM, VUG, RSP: Style/cap rotation (value, growth, equal-weight)
+    - IWM: Small-cap rotation
+    - EEM: Emerging markets rotation
 
     Caching Strategy:
     ----------------
-    - ETF performance could be cached for same trading day
-    - Holdings mapping is static and doesn't require caching
+    - ETF holdings are cached for up to 24 hours to reduce API calls
+    - ETF performance calculated fresh each call (no caching)
     - Individual stock validation still uses sector_cache table
 
     Returns:
         List of ticker symbols from rotating sectors (long + short candidates)
     """
     try:
-        # Get 1-month performance data for sector ETFs
-        sector_etfs = list(SECTOR_ETF_HOLDINGS.keys())
+        # Get dynamic sector holdings mapping
+        sector_holdings = _get_sector_etf_holdings_dynamic()
+
+        # Get 1-month performance data for all sector ETFs
+        sector_etfs = list(SECTOR_ETFS.keys())
         etf_performance = []
 
         for etf in sector_etfs:
             try:
-                stock = yf.Ticker(etf)
-                hist = stock.history(period='1mo')
+                ticker = yf.Ticker(etf)
+                hist = ticker.history(period='1mo')
 
                 if len(hist) >= 2:
                     start_price = hist['Close'].iloc[0]
@@ -541,7 +734,8 @@ def _get_sector_rotation_picks(db_path: str) -> List[str]:
 
                     etf_performance.append({
                         'etf': etf,
-                        'performance': performance
+                        'performance': performance,
+                        'name': SECTOR_ETFS.get(etf, etf)
                     })
             except Exception as e:
                 logger.debug(f"Failed to get performance for {etf}: {e}")
@@ -555,16 +749,18 @@ def _get_sector_rotation_picks(db_path: str) -> List[str]:
         # Top 2 performing sectors - get top 3 holdings each
         for etf_data in etf_performance[:2]:
             etf = etf_data['etf']
-            holdings = SECTOR_ETF_HOLDINGS[etf][:3]  # Top 3 holdings
-            rotation_picks.extend(holdings)
-            logger.info(f"Top sector {etf} ({etf_data['performance']:.2f}%): adding {holdings}")
+            holdings = sector_holdings.get(etf, [])[:3]  # Top 3 holdings
+            if holdings:
+                rotation_picks.extend(holdings)
+                logger.info(f"Top sector {etf} ({etf_data['name']}, {etf_data['performance']:.2f}%): adding {holdings}")
 
         # Bottom 2 performing sectors - get top 3 holdings each (short candidates)
         for etf_data in etf_performance[-2:]:
             etf = etf_data['etf']
-            holdings = SECTOR_ETF_HOLDINGS[etf][:3]  # Top 3 holdings
-            rotation_picks.extend(holdings)
-            logger.info(f"Bottom sector {etf} ({etf_data['performance']:.2f}%): adding {holdings}")
+            holdings = sector_holdings.get(etf, [])[:3]  # Top 3 holdings
+            if holdings:
+                rotation_picks.extend(holdings)
+                logger.info(f"Bottom sector {etf} ({etf_data['name']}, {etf_data['performance']:.2f}%): adding {holdings} (short candidates)")
 
         # Remove duplicates while preserving order
         unique_picks = []
@@ -574,7 +770,7 @@ def _get_sector_rotation_picks(db_path: str) -> List[str]:
                 unique_picks.append(ticker)
                 seen.add(ticker)
 
-        logger.info(f"Sector rotation picks: {unique_picks}")
+        logger.info(f"Sector rotation picks from {len(etf_performance)} ETFs: {unique_picks}")
         return unique_picks
 
     except Exception as e:

@@ -10,3 +10,4 @@ plotly
 python-dotenv
 libsql-client
 apscheduler
+pytest
