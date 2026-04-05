@@ -127,13 +127,11 @@ def _fetch_articles(keyword: str, topic_name: str, max_results: int) -> List[Dic
     api_key = os.getenv('NEWSAPI_AI_KEY')
 
     payload = {
+        'action': 'getArticles',
         'apiKey': api_key,
-        '$query': {
-            '$and': [
-                {'keyword': keyword, 'keywordLoc': 'title,body'},
-                {'lang': 'eng'},
-            ]
-        },
+        'keyword': keyword,
+        'keywordLoc': 'body,title',
+        'lang': 'eng',
         'isDuplicateFilter': 'skipDuplicates',
         'dataType': ['news'],
         'articlesPage': 1,

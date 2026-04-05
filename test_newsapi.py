@@ -58,7 +58,10 @@ def _probe(label, payload):
     return count
 
 base_query = {
+    'action': 'getArticles',
     'apiKey': api_key,
+    'keywordLoc': 'body,title',
+    'lang': 'eng',
     'isDuplicateFilter': 'skipDuplicates',
     'dataType': ['news'],
     'articlesPage': 1,
@@ -75,16 +78,13 @@ base_query = {
 }
 
 def make_query(keyword):
-    return {**base_query, '$query': {'$and': [
-        {'keyword': keyword, 'keywordLoc': 'title,body'},
-        {'lang': 'eng'},
-    ]}}
+    return {**base_query, 'keyword': keyword}
 
-_probe("$query inflation",  make_query('inflation'))
-_probe("$query tariff",     make_query('tariff'))
-_probe("$query recession",  make_query('recession'))
-_probe("$query earnings",   make_query('earnings'))
-_probe("$query oil",        make_query('oil'))
+_probe("inflation",  make_query('inflation'))
+_probe("tariff",     make_query('tariff'))
+_probe("recession",  make_query('recession'))
+_probe("earnings",   make_query('earnings'))
+_probe("oil",        make_query('oil'))
 
 print("PASS (probe complete)")
 
