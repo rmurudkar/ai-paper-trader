@@ -23,7 +23,7 @@ _request_date = None
 MARKETAUX_BASE_URL = "https://api.marketaux.com/v1/news/all"
 
 
-def fetch_news(tickers: List[str] = None, max_results: int = 20) -> List[Dict]:
+def fetch_news(tickers: List[str] = None, max_results: int = 20, broad: bool = False) -> List[Dict]:
     """Fetch ticker-tagged financial news from Marketaux API.
 
     Extracts pre-built sentiment_score per ticker (-1.0 to 1.0).
@@ -38,6 +38,8 @@ def fetch_news(tickers: List[str] = None, max_results: int = 20) -> List[Dict]:
                 In discovery mode, this parameter is ignored.
                 In watchlist mode, this is required.
         max_results: Maximum number of articles to return.
+        broad: When broad=True, fetch without ticker filtering for use by discovery.py.
+               When False, filter to provided tickers. Overrides TICKER_MODE behavior.
 
     Returns:
         List of dicts with keys: title, ticker, sentiment_score, snippet, url, published_at, source.
@@ -59,6 +61,7 @@ def fetch_news(tickers: List[str] = None, max_results: int = 20) -> List[Dict]:
         # Generate yesterday's date for filtering recent articles
         published_after = _get_published_after()
 
+        # TODO: implement broad mode filtering
         # Build API parameters based on mode
         if ticker_mode == 'discovery':
             # Discovery mode: fetch broad news, no ticker filter

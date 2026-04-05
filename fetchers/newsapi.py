@@ -186,7 +186,8 @@ def fetch_headlines(
     topics: List[str] = None,
     max_results: int = 15,
     discovery_context: Dict = None,
-    watchlist: List[str] = None
+    watchlist: List[str] = None,
+    broad: bool = False
 ) -> List[Dict]:
     """Fetch macro/geopolitical/economic headlines from NewsAPI.ai with discovery integration.
 
@@ -199,6 +200,8 @@ def fetch_headlines(
         max_results: Maximum total articles across all topics.
         discovery_context: Optional discovery context from discovery.py containing mode and tickers.
         watchlist: Optional list of ticker symbols for filtering.
+        broad: When broad=True, fetch without ticker filtering for use by discovery.py.
+               When False, filter to provided tickers. Works with discovery_context.
 
     Returns:
         List of dicts with keys: title, snippet, topics, url, published_at, source, needs_full_text.
@@ -243,6 +246,7 @@ def fetch_headlines(
     all_articles.sort(key=lambda x: x.get('published_at', ''), reverse=True)
     all_articles = all_articles[:max_results]
 
+    # TODO: implement broad mode filtering
     # Apply mode-based processing
     if mode == 'discovery':
         # Discovery mode: Extract tickers from all articles for discovery feedback
