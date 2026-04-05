@@ -18,7 +18,8 @@ Uses paper trading only — no real money trades.
 - newspaper3k (fallback article scraper)
 - BeautifulSoup4 (fallback for unparseable sites)
 - APScheduler (continuous scheduler / event loop)
-- SQLite (trade log, outcome tracking, weight tables)
+- Turso (distributed SQLite database)
+- libsql-client (Turso Python client)
 - Streamlit (dashboard)
 
 ## Project Structure
@@ -49,7 +50,8 @@ paper-trader/
 ├── dashboard/
 │   └── app.py               # Streamlit UI
 ├── db/
-│   └── schema.sql           # SQLite schema: trades, outcomes, weights
+│   ├── client.py            # Turso database connection manager
+│   └── schema.sql           # Turso schema: trades, outcomes, weights
 ├── .env.example
 ├── requirements.txt
 └── CLAUDE.md
@@ -63,6 +65,8 @@ ALPACA_SECRET_KEY=
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
 MARKETAUX_API_KEY=
 NEWSAPI_AI_KEY=
+TURSO_CONNECTION_URL=libsql://your-database-name-random.turso.io
+TURSO_AUTH_TOKEN=
 TICKER_MODE=discovery      # "watchlist" = trade only user-defined tickers, "discovery" = find tickers from news + market scans
 WATCHLIST=AAPL,MSFT,NVDA   # optional: only used when TICKER_MODE=watchlist, or as a "always include" list in discovery mode
 MAX_DISCOVERY_TICKERS=30   # max tickers to track per cycle in discovery mode (prevents API overload)
@@ -174,138 +178,195 @@ Strategies run against whatever tickers discovery.py returned — they are ticke
 - Confidence scales with trend strength (distance from MA as % of price)
 
 **Mean Reversion**
-- Buy if RSI(14) < 30 (oversold)
-- Sell if RSI(14) > 70 (overbought)
-- Confidence scales with RSI extremity (RSI 20 = higher confidence than RSI 29)
+- Buy if RSI(14) is below 30 (oversold) on a green day
+- Sell if RSI(14) is above 70 (overbought) on a red day
+- Confidence scales with RSI extremity (0.3 = 30 RSI, 0.7 = RSI closer to 20)
 
-**MA Crossover**
-- Buy on golden cross: 50MA crosses above 200MA
-- Sell on death cross: 50MA crosses below 200MA
-- Confidence = 0.8 (fixed — crossovers are binary events)
-- Only fire on the day of the crossover, not while already crossed
+**Moving Average Crossover**
+- Buy if 20MA crosses above 50MA
+- Sell if 20MA crosses below 50MA
+- Confidence 0.8 (high conviction, infrequent signal)
 
-**News Catalyst** (from sentiment.py)
-- Buy if aggregated sentiment > +0.3
-- Sell if aggregated sentiment < -0.3
-- Confidence = abs(sentiment_score)
+**Volume Surge**
+- Buy if today's volume > 1.5x 20-day avg volume AND price is up (breakout volume)
+- Sell if volume surge AND price is down (panic volume)
+- Confidence 0.5 (requires confirmation from sentiment or regime)
 
-### 10. engine/regime.py — Macro Regime Filter
-Determines the current market environment before any trade is approved.
-
-**Inputs:**
-- VIX level (from yfinance ^VIX)
-- SPY price vs 200MA (above = bullish, below = bearish)
-- 10yr-2yr yield spread (inverted = recession risk)
-- Claude macro news classification (RISK_ON / RISK_OFF / NEUTRAL from recent macro articles)
-
-**Output:**
+Return per strategy:
 ```python
 {
-    "mode": "risk_on" | "risk_off" | "neutral",
-    "position_size_multiplier": 0.0 - 1.0,   # scales all position sizes
-    "confidence_threshold": 0.7 - 0.95,       # minimum confidence to act
-    "max_open_positions": 1 - 5               # max concurrent positions
+    "signal": "BUY",
+    "confidence": 0.75,
+    "strategy": "momentum",
+    "reason": "price above 20MA which is above 50MA"
 }
 ```
 
-**Rules:**
-- VIX > 30 → risk_off, position_size_multiplier = 0.3
-- VIX > 40 → risk_off, position_size_multiplier = 0.0 (halt trading)
-- SPY below 200MA → risk_off, raise confidence_threshold to 0.85
-- Yield curve inverted → risk_off, reduce max_open_positions to 2
-- Claude macro classification: weight recent 48hr news into final mode decision
+### 10. engine/regime.py — Macro Regime Filter
+Classify the current market regime. Data comes from fetchers/market.py.
+
+**Risk-On (green light for long trades)**
+- VIX < 20
+- SPY price > SPY 200MA (uptrend)
+- 10yr-2yr yield spread > 0.5% (normal or positive curve)
+- Regime override: "risk_on"
+
+**Risk-Off (green light for shorts, filter longs)**
+- VIX > 25
+- SPY price < SPY 200MA (downtrend)
+- 10yr-2yr yield spread < -0.5% (inverted curve)
+- Regime override: "risk_off"
+
+**Neutral (no special regime, trade normally)**
+- Everything else
+
+Determine net sentiment from NewsAPI/macro articles (economic data, Fed, geopolitical).
+If strongly negative macro sentiment detected, downshift to risk-off even if technical indicators are neutral.
+
+Return:
+```python
+{
+    "regime": "risk_on",
+    "vix": 18.5,
+    "spy_vs_200ma": 0.02,
+    "yield_spread": 0.65,
+    "macro_sentiment": "positive",
+    "confidence": 0.85
+}
+```
 
 ### 11. engine/combiner.py — Weighted Signal Combiner
-Merges all strategy signals + sentiment into a single actionable signal per ticker.
+Take outputs from strategies (9), regime (10), and sentiment (8). Produce final trading signal per ticker.
 
-**Process:**
-1. Collect signals from: momentum, mean_reversion, ma_crossover, news_catalyst
-2. Apply learned weights from feedback/weights.py to each strategy's confidence
-3. Compute weighted average confidence per ticker per direction (BUY vs SELL)
-4. Apply regime filter: multiply confidence by `position_size_multiplier`, enforce `confidence_threshold`
-5. Final output per ticker: `{signal: BUY|SELL|HOLD, confidence: float, strategies_agreeing: list}`
+**Per-ticker calculation:**
+1. Collect all strategy signals for the ticker
+2. Weight each by its learned weight from Turso `weights` table
+3. Multiply by regime modifier:
+   - If regime = risk_on: keep BUY confidence as-is, reduce SELL confidence by 20%
+   - If regime = risk_off: keep SELL confidence as-is, reduce BUY confidence by 30%
+   - If regime = neutral: no modifier
+4. If sentiment is available, include it as a separate signal with learned weight
+5. Average all weighted signals
+6. Round to BUY (>0.55) / SELL (<0.45) / HOLD (0.45–0.55)
 
-**Weight table** (initial defaults, adjusted by feedback loop):
+**Output per ticker:**
 ```python
-weights = {
-    "momentum":       0.75,
-    "mean_reversion": 0.65,
-    "ma_crossover":   0.70,
-    "news_catalyst":  0.60
+{
+    "ticker": "AAPL",
+    "signal": "BUY",
+    "confidence": 0.72,
+    "components": {
+        "momentum": 0.80,           # strategy confidence
+        "sentiment": 0.65,
+        "regime_adjusted": 0.72     # after regime filter
+    },
+    "regime": "risk_on",
+    "rationale": "Momentum + positive sentiment, risk-on regime"
 }
 ```
 
-Only act on signals where `confidence > regime.confidence_threshold` AND at least 2 strategies agree on direction.
+### 12. risk/manager.py — Risk Management
+Before any order is placed, run through risk checks. Reject orders that violate hard limits.
 
-### 12. risk/manager.py — Risk Management Gate
-Every signal MUST pass through the risk manager before reaching the executor. The risk manager can veto or resize any trade. This layer is non-negotiable — never bypass it.
+**For each signal:**
+1. **Position sizing**: Allocate max_allocation % of portfolio
+   - Risk per trade = max 2% of portfolio
+   - Position size = risk_amount / (entry_price - stop_loss_price)
+   - Cap at max 500 shares per ticker (prevent concentration)
 
-**Hard Rules (never overridden):**
-- Max position size: never more than 10% of total portfolio value in one ticker
-- Max open positions: governed by regime filter (default 5, reduced in risk-off)
-- Stop loss: place a stop-loss order at -3% from entry on every BUY
-- Take profit: place a limit sell at +8% from entry on every BUY
-- Max daily loss: if portfolio is down 5% from day open, halt ALL trading for the day
-- Max weekly loss: if portfolio is down 10% from week open, halt ALL trading until manual override
-- Market hours: reject any order if market is closed (check Alpaca calendar)
-- Sector concentration limit: no more than 30% of portfolio in a single sector. Since the system can discover ANY ticker, use a sector lookup (yfinance `.info["sector"]`) to classify tickers dynamically at runtime. Cache sector lookups in SQLite to avoid repeated API calls. If sector lookup fails, treat the ticker as "unknown" sector and apply a conservative 5% max position size instead of 10%.
-- Cash reserve: always keep at least 20% of portfolio in cash — never go all-in
-- Penny stock filter: reject any ticker with price < $5 or average daily volume < 500,000 — these are too illiquid and volatile for automated trading
-- Market cap floor: reject tickers with market cap < $1B (micro-caps are too risky for autonomous trading)
+2. **Stop loss placement**: 
+   - For BUY: stop = entry_price * 0.97 (3% below entry)
+   - For SELL: stop = entry_price * 1.03 (3% above entry)
 
-**Position Sizing Formula:**
+3. **Take profit placement**:
+   - For BUY: TP = entry_price * 1.03 (3% above entry) — will adjust once position is in profit
+   - For SELL: TP = entry_price * 0.97 (3% below entry)
+
+4. **Hard rules (reject if any are violated)**:
+   - Total portfolio allocation <= 80% (keep 20% cash)
+   - Single ticker max 10% of portfolio
+   - Single sector max 30% of portfolio
+   - No penny stocks (price < $5)
+   - No micro-caps (market cap < $1B)
+   - Maximum 15 open positions at once
+   - No duplicate signals on same ticker within 2 hours (prevent churn)
+
+5. **Correlation check** (if sector data available):
+   - If proposing a BUY in sector X that already holds 20% of portfolio, reduce position size by 50%
+
+6. **Sector lookup**:
+   - Query Turso `sector_cache` for ticker sector
+   - If not in cache, fetch via yfinance and insert
+
+**Return:**
 ```python
-base_size = portfolio_value * 0.10                    # 10% max
-sized = base_size * signal_confidence                  # scale by confidence
-regime_adjusted = sized * regime.position_size_multiplier  # scale by regime
-final_shares = floor(regime_adjusted / current_price)  # convert to whole shares
+{
+    "approved": True,
+    "reason": "",
+    "position_size": 45,
+    "shares": 45,
+    "entry_price": 175.50,
+    "stop_loss": 170.24,
+    "take_profit": 180.67,
+    "portfolio_allocation_pct": 2.1
+}
 ```
 
-### 13. executor/alpaca.py — Paper Trade Executor
-- Submit paper trade orders via Alpaca SDK
-- Market orders for entries
-- Simultaneously place bracket orders: stop-loss at -3%, take-profit at +8%
-- Log every order with: timestamp, ticker, signal, confidence, order_id, fill_price, shares
-- On fill confirmation: write to feedback/logger.py with full signal metadata
-- NEVER use live trading endpoint — always `https://paper-api.alpaca.markets`
+or if rejected:
+```python
+{
+    "approved": False,
+    "reason": "Sector allocation would exceed 30% (current: 25%, new: 8%)"
+}
+```
 
-### 14. feedback/logger.py — Trade Signal Logger
-On every executed trade, log the full provenance:
+### 13. executor/alpaca.py — Alpaca Order Executor
+Receives approved signals from risk/manager.py. Place actual orders on Alpaca paper account.
+
+- Check market hours before submitting any order
+- Submit limit order at entry_price (or current price + 0.1% slippage buffer)
+- Set stop loss and take profit via order bracket (if supported by Alpaca SDK)
+- If bracket not supported, place stop as a separate order immediately after entry fill
+- On successful fill: return `{order_id, symbol, filled_price, shares}`
+- On failure: return error message; do NOT retry within same cycle
+- Track all orders in a local dict (order_id -> signal_metadata) for the feedback loop
+
+### 14. feedback/logger.py — Trade Logger
+Every time an order fills, log the trade to Turso `trades` table.
+
+Write metadata:
 ```python
 {
     "trade_id": "uuid",
     "ticker": "AAPL",
     "signal": "BUY",
-    "confidence": 0.82,
-    "sentiment_score": 0.74,
-    "sentiment_source": "marketaux",
-    "strategies_fired": ["momentum", "news_catalyst"],
-    "discovery_sources": ["news", "gainer"],   # how this ticker was discovered
+    "confidence": 0.72,
+    "sentiment_score": 0.65,
+    "sentiment_source": "newsapi",
+    "strategies_fired": ["momentum", "sentiment"],    # JSON array
+    "discovery_sources": ["news", "gainer"],          # JSON array
     "regime_mode": "risk_on",
-    "article_urls": ["https://..."],
-    "entry_price": 182.50,
-    "shares": 5,
-    "stop_loss_price": 177.03,
-    "take_profit_price": 197.10,
-    "timestamp": "2026-04-04T14:32:00Z"
+    "article_urls": ["url1", "url2"],                 # JSON array
+    "entry_price": 175.50,
+    "shares": 45,
+    "stop_loss_price": 170.24,
+    "take_profit_price": 180.67,
+    "order_id": "alpaca-order-id",
+    "created_at": "2026-04-04T14:32:00Z"
 }
 ```
-Store in SQLite `trades` table.
 
 ### 15. feedback/outcomes.py — Outcome Measurement
-A scheduled job that runs hourly. For each open trade past its measurement window:
+Scheduled job: runs every 4 hours and at market close, checks all open trades for exits.
 
-**Measurement windows** (configurable):
-- Short-term: 4 hours (for day-trade style signals)
-- Medium-term: 24 hours (default for swing signals)
-- Long-term: 72 hours (for MA crossover signals)
-
-**Process:**
-1. Query `trades` table for trades past their measurement window
-2. Fetch current price from Alpaca or yfinance
-3. Compute return_pct = (current_price - entry_price) / entry_price
+For each open trade:
+1. Fetch current price from yfinance
+2. If holding > N hours (default 8 hours):
+   - Calculate return: (current_price - entry_price) / entry_price
+3. If stop loss or take profit hit, close position immediately
+   - Set exit_price to stop/TP price
 4. Classify: WIN (return > +1%), LOSS (return < -1%), NEUTRAL (between)
-5. Write to SQLite `outcomes` table:
+5. Write to Turso `outcomes` table:
 ```python
 {
     "trade_id": "uuid",
@@ -336,16 +397,16 @@ Update weights for:
 - The strategy that fired (momentum, mean_reversion, etc.)
 - The news source that contributed (marketaux, newsapi, scraped)
 
-Store in SQLite `weights` table. The combiner reads from this table on every cycle.
+Store in Turso `weights` table. The combiner reads from this table on every cycle.
 
 **Circuit Breaker:**
 - Track rolling 7-day win rate across all trades
 - If win rate falls below 40%:
   1. Halt ALL new trades automatically
   2. Send alert via email and/or Slack
-  3. Set `circuit_breaker_tripped = True` in DB
+  3. Set `tripped = True` in Turso `circuit_breaker` table
   4. Scheduler skips all trading jobs until manual reset
-- Manual reset: human sets `circuit_breaker_tripped = False` via dashboard or CLI
+- Manual reset: human sets `tripped = False` via dashboard or CLI
 
 ### 17. dashboard/app.py — Streamlit UI
 - Portfolio overview: cash, positions, total value, daily P&L
@@ -360,7 +421,31 @@ Store in SQLite `weights` table. The combiner reads from this table on every cyc
 - Win rate chart: rolling 7-day win rate with 40% threshold line
 - **Settings panel**: toggle TICKER_MODE (watchlist / discovery), edit WATCHLIST, adjust MAX_DISCOVERY_TICKERS
 
-### 18. db/schema.sql — SQLite Schema
+### 18. db/client.py — Turso Database Manager
+Initialize and manage Turso connection.
+
+```python
+import os
+from libsql_client import create_client_sync
+
+def get_db():
+    url = os.getenv("TURSO_CONNECTION_URL")
+    auth_token = os.getenv("TURSO_AUTH_TOKEN")
+    
+    client = create_client_sync(
+        url=url,
+        auth_token=auth_token
+    )
+    
+    return client
+
+# Usage throughout app:
+# db = get_db()
+# result = db.execute("SELECT * FROM trades WHERE ticker = ?", [ticker])
+# db.execute("INSERT INTO trades (...) VALUES (...)")
+```
+
+### 19. db/schema.sql — Turso Schema
 ```sql
 CREATE TABLE trades (
     trade_id TEXT PRIMARY KEY,
@@ -442,7 +527,7 @@ CREATE TABLE discovery_log (
 - NEVER exceed 30% portfolio allocation in a single sector
 - NEVER hardcode ticker lists in any module except discovery.py — all downstream modules receive tickers dynamically
 - ALWAYS run discovery.py as the FIRST step in every trading cycle
-- ALWAYS look up sector via yfinance for any newly discovered ticker and cache it
+- ALWAYS look up sector via yfinance for any newly discovered ticker and cache it in Turso
 - One ticker at a time through the signal engine — no batch parallelism yet
 
 ## Ticker Modes
@@ -463,19 +548,21 @@ apscheduler
 streamlit
 plotly
 python-dotenv
+libsql-client
 ```
 
 ## Implementation Priority
 Build in this order — each layer depends on the ones before it:
 
-1. **db/schema.sql** — create the SQLite tables first (including sector_cache and discovery_log)
-2. **scheduler/loop.py** — basic event loop with market hours check
-3. **fetchers/discovery.py** — ticker discovery engine (watchlist + dynamic modes)
-4. **engine/strategies.py** — momentum, mean reversion, MA crossover
-5. **engine/regime.py** — macro regime filter
-6. **engine/combiner.py** — weighted signal combiner replacing old signals.py
-7. **risk/manager.py** — position sizing + all hard rules + dynamic sector lookup
-8. **feedback/logger.py** — trade logging on execution
-9. **feedback/outcomes.py** — outcome measurement scheduled job
-10. **feedback/weights.py** — weight adjustment + circuit breaker
-11. **dashboard/app.py** — update to show new data (discovery panel, weights, regime, sector exposure, circuit breaker)
+1. **db/client.py** — create Turso connection manager and initialize schema
+2. **db/schema.sql** — create all Turso tables (trades, outcomes, weights, circuit_breaker, sector_cache, discovery_log)
+3. **scheduler/loop.py** — basic event loop with market hours check
+4. **fetchers/discovery.py** — ticker discovery engine (watchlist + dynamic modes)
+5. **engine/strategies.py** — momentum, mean reversion, MA crossover
+6. **engine/regime.py** — macro regime filter
+7. **engine/combiner.py** — weighted signal combiner replacing old signals.py
+8. **risk/manager.py** — position sizing + all hard rules + dynamic sector lookup (queries Turso sector_cache)
+9. **feedback/logger.py** — trade logging to Turso on execution
+10. **feedback/outcomes.py** — outcome measurement scheduled job (writes to Turso)
+11. **feedback/weights.py** — weight adjustment + circuit breaker (reads/writes Turso weights and circuit_breaker tables)
+12. **dashboard/app.py** — update to show new data (discovery panel, weights, regime, sector exposure, circuit breaker, pull from Turso)

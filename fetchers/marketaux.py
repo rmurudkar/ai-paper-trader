@@ -17,8 +17,7 @@ logger = logging.getLogger(__name__)
 _request_count = 0
 _request_date = None
 
-# Default watchlist for when tickers=None (from CLAUDE.md)
-DEFAULT_WATCHLIST = ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'TSLA', 'JPM', 'SPY', 'QQQ']
+# No default watchlist - tickers come from discovery.py or env var
 
 # MarketAux API configuration
 MARKETAUX_BASE_URL = "https://api.marketaux.com/v1/news/all"
@@ -30,9 +29,14 @@ def fetch_news(tickers: List[str] = None, max_results: int = 20) -> List[Dict]:
     Extracts pre-built sentiment_score per ticker (-1.0 to 1.0).
     DO NOT re-analyze Marketaux sentiment with Claude — use it directly.
 
+    Behavior depends on TICKER_MODE environment variable:
+    - discovery mode: fetch broad financial news (no ticker filter), return ALL articles with ticker tags
+    - watchlist mode: fetch news filtered to provided tickers only
+
     Args:
         tickers: List of stock ticker symbols to filter for (e.g. ['AAPL', 'MSFT']).
-                If None, uses default watchlist to ensure sentiment analysis.
+                In discovery mode, this parameter is ignored.
+                In watchlist mode, this is required.
         max_results: Maximum number of articles to return.
 
     Returns:
@@ -49,17 +53,26 @@ def fetch_news(tickers: List[str] = None, max_results: int = 20) -> List[Dict]:
             logger.error("MARKETAUX_API_KEY not found in environment variables")
             return []
 
-        # Use default watchlist if no tickers provided (ensures sentiment analysis)
-        effective_tickers = tickers if tickers else DEFAULT_WATCHLIST
+        # Check ticker mode from environment
+        ticker_mode = os.getenv('TICKER_MODE', 'discovery')
 
         # Generate yesterday's date for filtering recent articles
         published_after = _get_published_after()
 
-        # Build API parameters
-        params = _build_params(effective_tickers, published_after, max_results)
+        # Build API parameters based on mode
+        if ticker_mode == 'discovery':
+            # Discovery mode: fetch broad news, no ticker filter
+            params = _build_discovery_params(published_after, max_results)
+            logger.info(f"Making MarketAux API request in discovery mode (no ticker filter)")
+        else:
+            # Watchlist mode: filter by provided tickers
+            if not tickers:
+                logger.error("Watchlist mode requires tickers parameter")
+                return []
+            params = _build_watchlist_params(tickers, published_after, max_results)
+            logger.info(f"Making MarketAux API request in watchlist mode for tickers: {tickers}")
 
         # Make API request
-        logger.info(f"Making MarketAux API request for tickers: {effective_tickers}")
         response = requests.get(MARKETAUX_BASE_URL, params=params, timeout=30)
         response.raise_for_status()
 
@@ -97,8 +110,30 @@ def _check_rate_limit():
         )
 
 
-def _build_params(tickers: List[str], published_after: str, max_results: int) -> Dict:
-    """Build API request parameters for MarketAux API.
+def _build_discovery_params(published_after: str, max_results: int) -> Dict:
+    """Build API request parameters for discovery mode (broad news, no ticker filter).
+
+    Args:
+        published_after: Date string in YYYY-MM-DD format.
+        max_results: Maximum number of articles to return.
+
+    Returns:
+        Dictionary of API parameters for discovery mode.
+    """
+    params = {
+        'api_token': os.getenv('MARKETAUX_API_KEY'),
+        'filter_entities': 'true',
+        'language': 'en',
+        'limit': max_results,
+        'published_after': published_after
+        # No 'symbols' parameter - fetch all financial news
+    }
+
+    return params
+
+
+def _build_watchlist_params(tickers: List[str], published_after: str, max_results: int) -> Dict:
+    """Build API request parameters for watchlist mode (filtered by tickers).
 
     Args:
         tickers: List of stock ticker symbols.
@@ -106,7 +141,7 @@ def _build_params(tickers: List[str], published_after: str, max_results: int) ->
         max_results: Maximum number of articles to return.
 
     Returns:
-        Dictionary of API parameters.
+        Dictionary of API parameters for watchlist mode.
     """
     params = {
         'api_token': os.getenv('MARKETAUX_API_KEY'),

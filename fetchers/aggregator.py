@@ -20,7 +20,8 @@ def fetch_all_news(
     max_newsapi: int = 15,
     max_polygon: int = 20,
     max_alpaca: int = 15,
-    watchlist: List[str] = None
+    watchlist: List[str] = None,
+    discovery_context: Dict = None
 ) -> List[Dict]:
     """Fetch and merge all news sources with waterfall enrichment.
 
@@ -42,7 +43,8 @@ def fetch_all_news(
         max_newsapi: Maximum articles from newsapi.fetch_headlines().
         max_polygon: Not used directly (called via fetch_full_text).
         max_alpaca: Maximum articles from alpaca_news.fetch_news().
-        watchlist: List of ticker symbols for filtering.
+        watchlist: List of ticker symbols for filtering (legacy parameter).
+        discovery_context: Discovery context from discovery.py containing mode and tickers.
 
     Returns:
         Unified list sorted by published_at desc with partial flag:
