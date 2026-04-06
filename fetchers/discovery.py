@@ -83,8 +83,14 @@ from .marketaux import fetch_news as fetch_marketaux
 from .newsapi import fetch_headlines as fetch_newsapi
 from .massive import fetch_news as fetch_massive
 from .market import fetch_sp500_tickers
-from .scraper import scrape as scrape_article
 from . import groq_client
+
+# Optional: import scraper for full-text article extraction (only used for Groq on Marketaux)
+try:
+    from .scraper import scrape as scrape_article
+    SCRAPER_AVAILABLE = True
+except ImportError:
+    SCRAPER_AVAILABLE = False
 
 # Load environment variables
 load_dotenv()
@@ -637,6 +643,7 @@ def _extract_tickers_from_news() -> Set[str]:
     tickers = set()
     groq_tickers = set()
     marketaux_tickers = {}  # ticker -> [articles]
+    massive_tickers = {}    # ticker -> [articles]
     newsapi_tickers = {}    # ticker -> [articles]
 
     try:
@@ -733,10 +740,10 @@ def _extract_tickers_from_news() -> Set[str]:
 
         # Groq-powered company name extraction (catches "Apple" → AAPL, etc.)
         groq_tickers = set()
-        all_articles = marketaux_articles + newsapi_articles
+        all_articles = marketaux_articles + massive_articles + newsapi_articles
 
         if all_articles:
-            logger.info(f"discovery |   → All articles combined: {len(marketaux_articles)} marketaux + {len(newsapi_articles)} newsapi = {len(all_articles)} total")
+            logger.info(f"discovery |   → All articles combined: {len(marketaux_articles)} marketaux + {len(massive_articles)} massive + {len(newsapi_articles)} newsapi = {len(all_articles)} total")
             for i, article in enumerate(all_articles):
                 title = article.get('title', 'No title')
                 snippet = article.get('snippet', '')[:80].replace('\n', ' ')
@@ -763,13 +770,15 @@ def _extract_tickers_from_news() -> Set[str]:
                     snippet = article.get('snippet', '') or article.get('description', '')
 
                     full_text = snippet  # Fallback to snippet
-                    if url:
+                    if url and SCRAPER_AVAILABLE:
                         try:
                             scrape_result = scrape_article(url, snippet)
                             full_text = scrape_result.get('text', snippet)
                             logger.debug(f"discovery |     Article {i+1}: Scraped {len(full_text)} chars from {url[:50]}...")
                         except Exception as e:
                             logger.debug(f"discovery |     Article {i+1}: Scraping failed, using snippet")
+                    elif url and not SCRAPER_AVAILABLE:
+                        logger.debug(f"discovery |     Article {i+1}: Scraper not available, using snippet")
 
                     # Send to Groq with full article text
                     text_to_extract = f"{title}\n{full_text}"
@@ -793,15 +802,17 @@ def _extract_tickers_from_news() -> Set[str]:
             logger.warning("discovery |   ⚠️  No articles from any source to run Groq extraction on")
 
         # Combine and show overlaps
-        regex_tickers = set(marketaux_tickers.keys()) | set(newsapi_tickers.keys())
+        marketaux_set = set(marketaux_tickers.keys())
+        massive_set = set(massive_tickers.keys())
+        newsapi_set = set(newsapi_tickers.keys())
+        regex_tickers = marketaux_set | massive_set | newsapi_set
         all_news_tickers = regex_tickers | groq_tickers
         groq_only = groq_tickers - regex_tickers
-        overlap_tickers = set(marketaux_tickers.keys()) & set(newsapi_tickers.keys())
 
         logger.info(f"discovery |   → News source analysis:")
-        logger.info(f"discovery |     Marketaux only: {len(set(marketaux_tickers.keys()) - overlap_tickers)} tickers")
-        logger.info(f"discovery |     NewsAPI only:   {len(set(newsapi_tickers.keys()) - overlap_tickers)} tickers")
-        logger.info(f"discovery |     Both sources:   {len(overlap_tickers)} tickers (higher confidence): {sorted(overlap_tickers)}")
+        logger.info(f"discovery |     Marketaux: {len(marketaux_set)} tickers")
+        logger.info(f"discovery |     Massive:   {len(massive_set)} tickers")
+        logger.info(f"discovery |     NewsAPI:   {len(newsapi_set)} tickers")
         if groq_only:
             logger.info(f"discovery |     Groq only:     {len(groq_only)} NEW tickers from company names: {sorted(groq_only)}")
 
@@ -810,7 +821,7 @@ def _extract_tickers_from_news() -> Set[str]:
     except Exception as e:
         logger.error(f"discovery | News ticker extraction failed: {e}")
 
-    return set(marketaux_tickers.keys()) | set(newsapi_tickers.keys()) | groq_tickers
+    return set(marketaux_tickers.keys()) | set(massive_tickers.keys()) | set(newsapi_tickers.keys()) | groq_tickers
 
 
 def _extract_tickers_from_text(text: str) -> Set[str]:
