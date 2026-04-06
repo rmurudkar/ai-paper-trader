@@ -444,6 +444,56 @@ def save_sp500_cache(tickers: List[str]) -> None:
 
 
 # ============================================================================
+# SENTIMENT HISTORY UTILITIES
+# ============================================================================
+
+
+def save_sentiment_score(ticker: str, sentiment_score: float, article_count: int = 0) -> None:
+    """Record a sentiment score for a ticker at the current cycle.
+
+    Called once per ticker per cycle after sentiment analysis completes.
+    The sentiment_momentum strategy compares the latest score against the
+    previous cycle's score to detect narrative shifts.
+    """
+    db = get_db()
+    now = datetime.utcnow().isoformat() + "Z"
+    db.execute(
+        "INSERT INTO sentiment_history (ticker, sentiment_score, article_count, recorded_at) "
+        "VALUES (?, ?, ?, ?)",
+        [ticker, sentiment_score, article_count, now],
+    )
+    logger.debug(f"Saved sentiment for {ticker}: {sentiment_score} ({article_count} articles)")
+
+
+def get_previous_sentiment(ticker: str) -> Optional[Dict[str, Any]]:
+    """Get the most recent *prior* sentiment score for a ticker.
+
+    Skips the newest row (current cycle) and returns the one before it,
+    so the strategy can compute the delta between cycles.
+
+    Returns:
+        Dict with sentiment_score, article_count, recorded_at — or None.
+    """
+    db = get_db()
+    result = db.execute(
+        "SELECT sentiment_score, article_count, recorded_at "
+        "FROM sentiment_history "
+        "WHERE ticker = ? "
+        "ORDER BY recorded_at DESC "
+        "LIMIT 1 OFFSET 1",
+        [ticker],
+    )
+    if result.rows:
+        row = result.rows[0]
+        return {
+            "sentiment_score": row[0],
+            "article_count": row[1],
+            "recorded_at": row[2],
+        }
+    return None
+
+
+# ============================================================================
 # DISCOVERY LOG UTILITIES
 # ============================================================================
 

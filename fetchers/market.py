@@ -274,8 +274,20 @@ def _process_ticker_data(ticker: str, hist: pd.DataFrame) -> Dict:
         price_change_pct = ((current_price - prev_close) / prev_close) * 100 if prev_close else 0.0
         avg_volume_20 = float(hist['Volume'].rolling(20).mean().iloc[-1]) if len(hist) >= 20 else float(current_volume)
 
+        # Today's high/low and VWAP
+        day_high = None
+        day_low = None
+        vwap = None
+        if 'High' in hist.columns and 'Low' in hist.columns:
+            day_high = float(hist['High'].iloc[-1])
+            day_low = float(hist['Low'].iloc[-1])
+            vwap = (day_high + day_low + current_price) / 3.0
+
         return {
             'price': current_price,
+            'prev_close': prev_close,
+            'day_high': day_high,
+            'day_low': day_low,
             'volume': current_volume,
             'ma_20': ma_20,
             'ma_50': ma_50,
@@ -283,6 +295,7 @@ def _process_ticker_data(ticker: str, hist: pd.DataFrame) -> Dict:
             'rsi': rsi,
             'price_change_pct': price_change_pct,
             'avg_volume_20': avg_volume_20,
+            'vwap': vwap,
             'last_updated': datetime.now().isoformat() + 'Z'
         }
 
@@ -340,6 +353,12 @@ def _fetch_macro_indicators() -> Dict:
 
             if spy_ma_200:
                 macro_data['spy_vs_200ma'] = (spy_price - spy_ma_200) / spy_ma_200
+
+            # SPY daily change for relative strength comparison
+            if len(spy_hist) >= 2:
+                spy_prev = float(spy_hist['Close'].iloc[-2])
+                if spy_prev:
+                    macro_data['spy_change_pct'] = ((spy_price - spy_prev) / spy_prev) * 100
 
         # Treasury yields for yield spread
         try:

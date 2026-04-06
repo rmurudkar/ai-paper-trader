@@ -56,6 +56,16 @@ CREATE TABLE IF NOT EXISTS sp500_cache (
     fetched_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sentiment_history (
+    ticker TEXT NOT NULL,
+    sentiment_score REAL NOT NULL,
+    article_count INTEGER NOT NULL DEFAULT 0,
+    recorded_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sentiment_history_ticker_time
+    ON sentiment_history (ticker, recorded_at DESC);
+
 CREATE TABLE IF NOT EXISTS discovery_log (
     cycle_id TEXT NOT NULL,
     ticker TEXT NOT NULL,
