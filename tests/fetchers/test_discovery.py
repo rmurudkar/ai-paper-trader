@@ -22,6 +22,19 @@ import sys
 import sqlite3
 import tempfile
 import pytest
+import logging
+
+# Configure logging to show all discovery logs by default
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(message)s',
+    force=True  # Override any previous config
+)
+
+# Suppress verbose debug logs from external libraries
+logging.getLogger('yfinance').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
 
 # Ensure project root is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -68,6 +81,8 @@ def test_discovery_mode_output_shape():
             db_path = f.name
 
         result = discover_tickers(db_path=db_path)
+  
+        logging.info(result)
 
         # Required keys
         assert 'tickers' in result

@@ -81,7 +81,10 @@ import yfinance as yf
 # Import existing fetchers
 from .marketaux import fetch_news as fetch_marketaux
 from .newsapi import fetch_headlines as fetch_newsapi
+from .massive import fetch_news as fetch_massive
 from .market import fetch_sp500_tickers
+from .scraper import scrape as scrape_article
+from . import groq_client
 
 # Load environment variables
 load_dotenv()
@@ -156,10 +159,10 @@ def _get_sp500_tickers(fallback_size: int = 50) -> List[str]:
     try:
         # Try using existing market.py function first
         tickers = fetch_sp500_tickers()
-        logger.info(f"Fetched {len(tickers)} S&P 500 tickers from market data")
+        logger.info(f"discovery | Fetched {len(tickers)} S&P 500 tickers from market data")
         return tickers
     except Exception as e:
-        logger.debug(f"Could not fetch via fetch_sp500_tickers: {e}")
+        logger.debug(f"discovery | Could not fetch via fetch_sp500_tickers: {e}")
 
     # Fallback to curated top market cap companies (can be expanded)
     fallback = [
@@ -169,7 +172,7 @@ def _get_sp500_tickers(fallback_size: int = 50) -> List[str]:
         'TMO', 'MRK', 'WFC', 'ADBE', 'LIN', 'ACN', 'CSCO', 'DIS', 'ABT', 'NKE',
         'TXN', 'QCOM', 'DHR', 'PM', 'VZ', 'AMGN', 'COP', 'RTX', 'SPGI', 'NEE'
     ]
-    logger.warning(f"Using fallback S&P 500 ticker list ({len(fallback)} companies)")
+    logger.warning(f"discovery | Using fallback S&P 500 ticker list ({len(fallback)} companies)")
     return fallback[:fallback_size]
 
 
@@ -225,7 +228,7 @@ def _get_etf_holdings(etf_symbol: str, top_n: int = 5, cache_hours: int = 24) ->
                     break
 
     except Exception as e:
-        logger.debug(f"yfinance holdings lookup failed for {etf_symbol}: {e}")
+        logger.debug(f"discovery | yfinance holdings lookup failed for {etf_symbol}: {e}")
 
     # Method 2: Try Alpaca Assets API (if available)
     if not holdings:
@@ -242,7 +245,7 @@ def _get_etf_holdings(etf_symbol: str, top_n: int = 5, cache_hours: int = 24) ->
                 logger.debug(f"Alpaca asset lookup for {etf_symbol}: {asset}")
 
         except Exception as e:
-            logger.debug(f"Alpaca holdings lookup failed for {etf_symbol}: {e}")
+            logger.debug(f"discovery | Alpaca holdings lookup failed for {etf_symbol}: {e}")
 
     # Cache result (even if empty) and return
     if holdings:
@@ -255,7 +258,7 @@ def _get_etf_holdings(etf_symbol: str, top_n: int = 5, cache_hours: int = 24) ->
         # Cache the miss to avoid repeated failed lookups
         _sector_holdings_cache[cache_key] = []
         _sector_holdings_cache_time[cache_key] = datetime.now()
-        logger.debug(f"No dynamic holdings found for {etf_symbol}, will use fallback")
+        logger.debug(f"discovery | No dynamic holdings found for {etf_symbol}, will use fallback")
         return []
 
 
@@ -307,7 +310,7 @@ def _get_sector_etf_holdings_dynamic() -> Dict[str, List[str]]:
         else:
             # Use fallback for this ETF
             result[etf_symbol] = fallback_holdings.get(etf_symbol, [])
-            logger.debug(f"Using fallback holdings for {etf_symbol}")
+            logger.debug(f"discovery | Using fallback holdings for {etf_symbol}")
 
     return result
 
@@ -456,11 +459,16 @@ def discover_tickers(
         ticker_mode = os.getenv('TICKER_MODE', 'discovery').lower()
         max_tickers = int(os.getenv('MAX_DISCOVERY_TICKERS', '30'))
 
-        logger.info(f"Starting ticker discovery cycle {cycle_id} in {ticker_mode} mode")
+        logger.info("discovery | " + "=" * 76)
+        logger.info(f"discovery | STARTING TICKER DISCOVERY CYCLE: {cycle_id}")
+        logger.info(f"discovery | Mode: {ticker_mode.upper()} | Max Tickers: {max_tickers} | Pre-market: {is_premarket}")
+        logger.info("discovery | " + "=" * 76)
 
         if ticker_mode == 'watchlist':
+            logger.info("\ndiscovery | [MODE] Using WATCHLIST mode - only user-specified tickers")
             result = _discover_watchlist_mode()
         else:
+            logger.info("\ndiscovery | [MODE] Using DISCOVERY mode - dynamic ticker discovery from multiple sources\n")
             result = _discover_discovery_mode(db_path, max_tickers, is_premarket)
 
         # Add metadata
@@ -470,24 +478,42 @@ def discover_tickers(
         # Log discovery to database
         _log_discovery_cycle(db_path, cycle_id, result)
 
-        logger.info(f"Discovery cycle {cycle_id} complete: {len(result['tickers'])} tickers found")
+        # Final summary
+        logger.info("discovery | " + "=" * 76)
+        logger.info(f"discovery | DISCOVERY CYCLE COMPLETE")
+        logger.info(f"discovery | Cycle ID: {cycle_id}")
+        logger.info(f"discovery | Total tickers selected: {len(result['tickers'])}")
+        logger.info(f"discovery | Tickers: {', '.join(result['tickers'])}")
+        logger.info("discovery | " + "=" * 76)
+
         return result
 
     except Exception as e:
-        logger.error(f"Discovery failed: {e}")
+        logger.error(f"discovery | Discovery failed: {e}")
+        logger.error("discovery | Falling back to minimal ticker set (SPY, QQQ, IWM)")
         # Return minimal fallback
         return _get_fallback_tickers()
 
 
 def _discover_watchlist_mode() -> Dict:
     """Handle watchlist mode - return only user-specified tickers."""
+    logger.info("discovery | → Reading WATCHLIST environment variable...")
     watchlist = _get_user_watchlist()
 
     if not watchlist:
-        logger.warning("Watchlist mode specified but no WATCHLIST env var found")
+        logger.warning("discovery | ✗ Watchlist mode specified but no WATCHLIST env var found")
+        logger.warning("discovery | Falling back to SPY, QQQ, IWM (basic market ETFs)")
         return _get_fallback_tickers()
 
+    logger.info(f"discovery | ✓ WATCHLIST env var parsed: {watchlist}")
+    logger.info(f"discovery | → Validating {len(watchlist)} watchlist tickers...")
+
+    # Note: In watchlist mode, we don't validate - user explicitly specified these
     sources = {ticker: ['watchlist'] for ticker in watchlist}
+
+    logger.info(f"discovery | ✓ Watchlist mode: using {len(watchlist)} user-specified tickers")
+    for ticker in watchlist:
+        logger.info(f"discovery |   • {ticker}: user-specified via WATCHLIST env var")
 
     return {
         'tickers': watchlist,
@@ -500,48 +526,89 @@ def _discover_discovery_mode(db_path: str, max_tickers: int, is_premarket: bool)
     ticker_sources = {}
 
     # Source 1: News-driven discovery
-    logger.info("Discovering tickers from news sources...")
+    logger.info("\ndiscovery | [DISCOVERY SOURCE 1/5] Scanning news for ticker mentions...")
     news_tickers = _extract_tickers_from_news()
     for ticker in news_tickers:
         ticker_sources.setdefault(ticker, []).append('news')
+    logger.info(f"discovery | Summary: {len(news_tickers)} tickers found from news\n")
 
     # Source 2: Market movers
-    logger.info("Discovering market movers...")
+    logger.info("discovery | [DISCOVERY SOURCE 2/5] Analyzing market movers (gainers/losers)...")
     movers = _get_market_movers(db_path)
+    gainer_count = len(movers.get('gainers', []))
+    loser_count = len(movers.get('losers', []))
     for ticker in movers.get('gainers', []):
         ticker_sources.setdefault(ticker, []).append('gainer')
     for ticker in movers.get('losers', []):
         ticker_sources.setdefault(ticker, []).append('loser')
+    logger.info(f"discovery | Summary: {gainer_count} gainers + {loser_count} losers found\n")
 
     # Source 3: Sector rotation (pre-market only)
     if is_premarket:
-        logger.info("Analyzing sector rotation...")
+        logger.info("discovery | [DISCOVERY SOURCE 3/5] Analyzing sector rotation (pre-market)...")
         sector_picks = _get_sector_rotation_picks(db_path)
         for ticker in sector_picks:
             ticker_sources.setdefault(ticker, []).append('sector_rotation')
+        logger.info(f"discovery | Summary: {len(sector_picks)} tickers from sector rotation\n")
+    else:
+        logger.info("discovery | [DISCOVERY SOURCE 3/5] Sector rotation skipped (not pre-market)\n")
 
     # Source 4: Existing positions
-    logger.info("Including existing positions...")
+    logger.info("discovery | [DISCOVERY SOURCE 4/5] Checking for existing positions...")
     positions = _get_existing_positions()
     for ticker in positions:
         ticker_sources.setdefault(ticker, []).append('position')
+    logger.info(f"discovery | Summary: {len(positions)} existing positions found\n")
 
     # Source 5: User pinned watchlist
+    logger.info("discovery | [DISCOVERY SOURCE 5/5] Checking user watchlist...")
     user_watchlist = _get_user_watchlist()
     for ticker in user_watchlist:
         ticker_sources.setdefault(ticker, []).append('watchlist')
+    logger.info(f"discovery | Summary: {len(user_watchlist)} user-pinned tickers\n")
+
+    # Aggregate before filtering
+    logger.info("discovery | [AGGREGATION] Merging all discovery sources...")
+    logger.info(f"discovery | Total unique tickers found: {len(ticker_sources)}")
+
+    # Show tickers by source overlap for traceability
+    all_tickers = sorted(ticker_sources.keys())
+    logger.info(f"discovery | Complete ticker list: {all_tickers}")
+
+    # Analyze signal strength (how many sources mention each ticker)
+    logger.info("discovery | → Ticker signal strength (which sources mentioned it):")
+    ticker_signal = [(ticker, len(ticker_sources[ticker])) for ticker in all_tickers]
+    ticker_signal.sort(key=lambda x: x[1], reverse=True)
+
+    for ticker, signal_count in ticker_signal:
+        sources = ', '.join(ticker_sources[ticker])
+        logger.info(f"discovery |   {ticker:6s} [{signal_count} sources] {sources}")
+
+    logger.info("")
 
     # Pre-filter all tickers
-    logger.info("Pre-filtering discovered tickers...")
+    logger.info(f"discovery | [VALIDATION] Pre-filtering {len(ticker_sources)} tickers (checking price, cap, volume)...")
     filtered_sources = {}
+    failed_count = 0
     for ticker, sources in ticker_sources.items():
         if _validate_ticker(ticker, db_path):
             filtered_sources[ticker] = sources
         else:
-            logger.debug(f"Filtered out ticker {ticker}: failed validation")
+            failed_count += 1
+            logger.debug(f"discovery |   ✗ {ticker}: failed validation (price/cap/volume check)")
+
+    logger.info(f"discovery | ✓ {len(filtered_sources)} tickers passed validation, {failed_count} filtered out\n")
 
     # Prioritize and cap
+    logger.info(f"discovery | [PRIORITIZATION] Prioritizing and capping at {max_tickers} tickers...")
     final_sources = _prioritize_and_cap(filtered_sources, max_tickers)
+    logger.info(f"discovery | ✓ Final set: {len(final_sources)} tickers selected\n")
+
+    # Show final breakdown with sources
+    logger.info("discovery | [FINAL RESULT] Selected tickers by source:")
+    for ticker in sorted(final_sources.keys()):
+        sources = final_sources[ticker]
+        logger.info(f"discovery |   • {ticker}: {', '.join(sources)}")
 
     return {
         'tickers': list(final_sources.keys()),
@@ -568,29 +635,182 @@ def _extract_tickers_from_news() -> Set[str]:
         Set of ticker symbols found across news sources
     """
     tickers = set()
+    groq_tickers = set()
+    marketaux_tickers = {}  # ticker -> [articles]
+    newsapi_tickers = {}    # ticker -> [articles]
 
     try:
         # Fetch broad news from both sources
+        logger.info("discovery |   → Fetching Marketaux articles...")
         marketaux_articles = fetch_marketaux(tickers=None, max_results=20)
+        if marketaux_articles:
+            logger.info(f"discovery |     ✓ Fetched {len(marketaux_articles)} Marketaux articles with tickers")
+        else:
+            logger.warning("discovery |     ⚠️  Fetched 0 Marketaux articles WITH tickers")
+
+        logger.info("discovery |   → Fetching Massive articles...")
+        massive_articles = fetch_massive(tickers=None, max_results=50)
+        if massive_articles:
+            logger.info(f"discovery |     ✓ Fetched {len(massive_articles)} Massive articles with tickers")
+        else:
+            logger.warning("discovery |     ⚠️  Fetched 0 Massive articles with tickers")
+
+        logger.info("discovery |   → Fetching NewsAPI articles...")
         newsapi_articles = fetch_newsapi(max_results=15, discovery_context={'mode': 'discovery'})
+        logger.info(f"discovery |     ✓ Fetched {len(newsapi_articles)} NewsAPI articles")
 
         # Extract tickers from Marketaux (already has ticker field)
+        logger.info("discovery |   → Processing Marketaux articles for ticker mentions:")
         for article in marketaux_articles:
             if 'ticker' in article:
-                tickers.add(article['ticker'])
+                ticker = article['ticker']
+                title = article.get('title', 'No title')
+                source = article.get('source', 'Unknown source')
+                published = article.get('published_at', 'Unknown time')
+
+                if ticker not in marketaux_tickers:
+                    marketaux_tickers[ticker] = []
+                marketaux_tickers[ticker].append({
+                    'title': title,
+                    'source': source,
+                    'published': published
+                })
+
+                logger.debug(f"discovery |     [Marketaux] {ticker:6s} | {source:20s} | {title[:60]}")
+
+        logger.info(f"discovery |   ✓ Extracted {len(marketaux_tickers)} unique tickers from {len(marketaux_articles)} Marketaux articles")
+        if marketaux_tickers:
+            logger.info(f"discovery |     Tickers: {', '.join(sorted(marketaux_tickers.keys()))}")
+
+        # Extract tickers from Massive (already tagged in API response)
+        massive_tickers = {}  # ticker -> [articles]
+        logger.info("discovery |   → Processing Massive articles for ticker mentions:")
+        for article in massive_articles:
+            title = article.get('title', '')
+            source = article.get('source', 'Unknown source')
+            published = article.get('published_at', 'Unknown time')
+            article_tickers = article.get('tickers', [])
+
+            for ticker in article_tickers:
+                if ticker not in massive_tickers:
+                    massive_tickers[ticker] = []
+                massive_tickers[ticker].append({
+                    'title': title,
+                    'source': source,
+                    'published': published
+                })
+                logger.debug(f"discovery |     [Massive] {ticker:6s} | {source:20s} | {title[:60]}")
+
+        logger.info(f"discovery |   ✓ Extracted {len(massive_tickers)} unique tickers from {len(massive_articles)} Massive articles")
+        if massive_tickers:
+            logger.info(f"discovery |     Tickers: {', '.join(sorted(massive_tickers.keys()))}")
 
         # Extract tickers from NewsAPI using regex
+        logger.info("discovery |   → Processing NewsAPI articles for ticker mentions:")
         for article in newsapi_articles:
-            text = f"{article.get('title', '')} {article.get('snippet', '')}"
+            title = article.get('title', '')
+            snippet = article.get('snippet', '')
+            text = f"{title} {snippet}"
             article_tickers = _extract_tickers_from_text(text)
-            tickers.update(article_tickers)
 
-        logger.info(f"Extracted {len(tickers)} unique tickers from news: {sorted(tickers)}")
+            source = article.get('source', 'Unknown source')
+            published = article.get('published_at', 'Unknown time')
+
+            for ticker in article_tickers:
+                if ticker not in newsapi_tickers:
+                    newsapi_tickers[ticker] = []
+                newsapi_tickers[ticker].append({
+                    'title': title,
+                    'source': source,
+                    'published': published
+                })
+
+                logger.debug(f"discovery |     [NewsAPI] {ticker:6s} | {source:20s} | {title[:60]}")
+
+        logger.info(f"discovery |   ✓ Extracted {len(newsapi_tickers)} unique tickers from {len(newsapi_articles)} NewsAPI articles")
+        if newsapi_tickers:
+            logger.info(f"discovery |     Tickers: {', '.join(sorted(newsapi_tickers.keys()))}")
+
+        # Groq-powered company name extraction (catches "Apple" → AAPL, etc.)
+        groq_tickers = set()
+        all_articles = marketaux_articles + newsapi_articles
+
+        if all_articles:
+            logger.info(f"discovery |   → All articles combined: {len(marketaux_articles)} marketaux + {len(newsapi_articles)} newsapi = {len(all_articles)} total")
+            for i, article in enumerate(all_articles):
+                title = article.get('title', 'No title')
+                snippet = article.get('snippet', '')[:80].replace('\n', ' ')
+                source = article.get('source', 'unknown')
+                logger.debug(f"discovery |     [{i+1}] {source}: {title[:60]}... | snippet: {snippet}...")
+
+        if groq_client.is_available() and all_articles:
+            # Only run Groq on articles without ticker tags (Marketaux) or low-confidence extractions
+            articles_for_groq = []
+            for article in all_articles:
+                source = article.get('source', 'unknown')
+                # For Marketaux: use Groq if article has no ticker tag and groq_extract flag is set
+                # For NewsAPI: skip Groq for now (already regex-extracted)
+                if source == 'marketaux' and not article.get('ticker') and article.get('groq_extract'):
+                    articles_for_groq.append(article)
+
+            if articles_for_groq:
+                logger.info(f"discovery |   → Scraping full article text for {len(articles_for_groq)} Marketaux articles...")
+
+                # Scrape full content for better Groq context
+                for i, article in enumerate(articles_for_groq):
+                    title = article.get('title', '')
+                    url = article.get('url', '')
+                    snippet = article.get('snippet', '') or article.get('description', '')
+
+                    full_text = snippet  # Fallback to snippet
+                    if url:
+                        try:
+                            scrape_result = scrape_article(url, snippet)
+                            full_text = scrape_result.get('text', snippet)
+                            logger.debug(f"discovery |     Article {i+1}: Scraped {len(full_text)} chars from {url[:50]}...")
+                        except Exception as e:
+                            logger.debug(f"discovery |     Article {i+1}: Scraping failed, using snippet")
+
+                    # Send to Groq with full article text
+                    text_to_extract = f"{title}\n{full_text}"
+                    results = groq_client.extract_tickers_from_text(text_to_extract)
+
+                    if results:
+                        for item in results:
+                            ticker = item.get('ticker', '').upper()
+                            company = item.get('company', '')
+                            if ticker:
+                                groq_tickers.add(ticker)
+                                logger.info(f"discovery |     Found {ticker} ({company}) | {title[:50]}...")
+
+                if groq_tickers:
+                    logger.info(f"discovery |   ✓ Groq extracted {len(groq_tickers)} tickers via company name recognition: {sorted(groq_tickers)}")
+                else:
+                    logger.info("discovery |   ✓ Groq found no additional tickers from company names")
+        elif not groq_client.is_available():
+            logger.debug("discovery |   ⚠️  GROQ_API_KEY not set — skipping AI company name extraction (regex only)")
+        elif not all_articles:
+            logger.warning("discovery |   ⚠️  No articles from any source to run Groq extraction on")
+
+        # Combine and show overlaps
+        regex_tickers = set(marketaux_tickers.keys()) | set(newsapi_tickers.keys())
+        all_news_tickers = regex_tickers | groq_tickers
+        groq_only = groq_tickers - regex_tickers
+        overlap_tickers = set(marketaux_tickers.keys()) & set(newsapi_tickers.keys())
+
+        logger.info(f"discovery |   → News source analysis:")
+        logger.info(f"discovery |     Marketaux only: {len(set(marketaux_tickers.keys()) - overlap_tickers)} tickers")
+        logger.info(f"discovery |     NewsAPI only:   {len(set(newsapi_tickers.keys()) - overlap_tickers)} tickers")
+        logger.info(f"discovery |     Both sources:   {len(overlap_tickers)} tickers (higher confidence): {sorted(overlap_tickers)}")
+        if groq_only:
+            logger.info(f"discovery |     Groq only:     {len(groq_only)} NEW tickers from company names: {sorted(groq_only)}")
+
+        logger.info(f"discovery |   ✓ Total news discovery: {len(all_news_tickers)} unique tickers (regex: {len(regex_tickers)}, +groq: {len(groq_only)})")
 
     except Exception as e:
-        logger.error(f"News ticker extraction failed: {e}")
+        logger.error(f"discovery | News ticker extraction failed: {e}")
 
-    return tickers
+    return set(marketaux_tickers.keys()) | set(newsapi_tickers.keys()) | groq_tickers
 
 
 def _extract_tickers_from_text(text: str) -> Set[str]:
@@ -637,12 +857,15 @@ def _get_market_movers(db_path: str) -> Dict[str, List[str]]:
         movers_data = []
 
         # Dynamically fetch full S&P 500 list (falls back to static list on failure)
+        logger.info("discovery |   → Fetching S&P 500 ticker list...")
         sp500 = fetch_sp500_tickers()
-        logger.info(f"Scanning {len(sp500)} S&P 500 tickers for market movers")
+        logger.info(f"discovery |   ✓ Got {len(sp500)} S&P 500 tickers, downloading 2-day price history...")
 
         # Batch download 2-day history for all tickers at once
         data = yf.download(sp500, period='2d', group_by='ticker', auto_adjust=True, threads=True)
+        logger.info(f"discovery |   ✓ Downloaded price history, calculating daily changes...")
 
+        success_count = 0
         for ticker in sp500:
             try:
                 if len(sp500) == 1:
@@ -660,25 +883,46 @@ def _get_market_movers(db_path: str) -> Dict[str, List[str]]:
 
                     movers_data.append({
                         'ticker': ticker,
+                        'today_close': today_close,
+                        'yesterday_close': yesterday_close,
                         'change_pct': change_pct
                     })
+                    success_count += 1
             except Exception as e:
-                logger.debug(f"Failed to get data for {ticker}: {e}")
+                logger.debug(f"discovery | Failed to get data for {ticker}: {e}")
                 continue
+
+        logger.info(f"discovery |   ✓ Calculated changes for {success_count} tickers, identifying extremes...")
 
         # Sort by change percentage
         movers_data.sort(key=lambda x: x['change_pct'], reverse=True)
 
         # Get top 5 gainers and bottom 5 (losers)
+        logger.info("discovery |   → Top 5 GAINERS (highest % gain today):")
+        for m in movers_data[:5]:
+            ticker = m['ticker']
+            change = m['change_pct']
+            yesterday = m['yesterday_close']
+            today = m['today_close']
+            logger.info(f"discovery |     {ticker:6s} | ${yesterday:8.2f} → ${today:8.2f} | {change:+7.2f}%")
+
+        logger.info("discovery |   → Top 5 LOSERS (highest % loss today):")
+        for m in movers_data[-5:]:
+            ticker = m['ticker']
+            change = m['change_pct']
+            yesterday = m['yesterday_close']
+            today = m['today_close']
+            logger.info(f"discovery |     {ticker:6s} | ${yesterday:8.2f} → ${today:8.2f} | {change:+7.2f}%")
+
         gainers = [m['ticker'] for m in movers_data[:5]]
         losers = [m['ticker'] for m in movers_data[-5:]]
 
-        logger.info(f"Market movers - Gainers: {gainers}, Losers: {losers}")
+        logger.info(f"discovery |   ✓ Market movers discovery: {len(gainers)} gainers + {len(losers)} losers")
 
         return {'gainers': gainers, 'losers': losers}
 
     except Exception as e:
-        logger.error(f"Market movers discovery failed: {e}")
+        logger.error(f"discovery | Market movers discovery failed: {e}")
         return {'gainers': [], 'losers': []}
 
 
@@ -716,12 +960,15 @@ def _get_sector_rotation_picks(db_path: str) -> List[str]:
     """
     try:
         # Get dynamic sector holdings mapping
+        logger.info("discovery |   → Loading sector ETF holdings...")
         sector_holdings = _get_sector_etf_holdings_dynamic()
+        logger.info(f"discovery |   ✓ Loaded holdings for {len(sector_holdings)} ETFs")
 
         # Get 1-month performance data for all sector ETFs
         sector_etfs = list(SECTOR_ETFS.keys())
         etf_performance = []
 
+        logger.info(f"discovery |   → Analyzing 1-month performance for {len(sector_etfs)} sector/style ETFs...")
         for etf in sector_etfs:
             try:
                 ticker = yf.Ticker(etf)
@@ -734,33 +981,53 @@ def _get_sector_rotation_picks(db_path: str) -> List[str]:
 
                     etf_performance.append({
                         'etf': etf,
+                        'start_price': start_price,
+                        'end_price': end_price,
                         'performance': performance,
                         'name': SECTOR_ETFS.get(etf, etf)
                     })
             except Exception as e:
-                logger.debug(f"Failed to get performance for {etf}: {e}")
+                logger.debug(f"discovery | Failed to get performance for {etf}: {e}")
                 continue
+
+        logger.info(f"discovery |   ✓ Got performance data for {len(etf_performance)} ETFs")
 
         # Sort by performance
         etf_performance.sort(key=lambda x: x['performance'], reverse=True)
 
+        # Log all ETFs ranked by performance (info level)
+        logger.info("discovery |   → All sector ETFs ranked by 1-month performance:")
+        for rank, etf_data in enumerate(etf_performance, 1):
+            etf = etf_data['etf']
+            perf = etf_data['performance']
+            start = etf_data['start_price']
+            end = etf_data['end_price']
+            name = etf_data['name'][:40]  # Truncate long names
+            logger.info(f"discovery |     {rank:2d}. {etf:6s} | ${start:8.2f} → ${end:8.2f} | {perf:+7.2f}% | {name}")
+
         rotation_picks = []
 
         # Top 2 performing sectors - get top 3 holdings each
-        for etf_data in etf_performance[:2]:
+        logger.info("discovery |   → Selecting from TOP 2 performing sectors (LONG candidates):")
+        for rank_idx, etf_data in enumerate(etf_performance[:2], 1):
             etf = etf_data['etf']
             holdings = sector_holdings.get(etf, [])[:3]  # Top 3 holdings
             if holdings:
                 rotation_picks.extend(holdings)
-                logger.info(f"Top sector {etf} ({etf_data['name']}, {etf_data['performance']:.2f}%): adding {holdings}")
+                logger.info(f"discovery |     #{rank_idx} {etf} ({etf_data['name']}, {etf_data['performance']:+.2f}%) → holdings: {holdings}")
+            else:
+                logger.info(f"discovery |     #{rank_idx} {etf} ({etf_data['name']}, {etf_data['performance']:+.2f}%) → no holdings available")
 
         # Bottom 2 performing sectors - get top 3 holdings each (short candidates)
-        for etf_data in etf_performance[-2:]:
+        logger.info("discovery |   → Selecting from BOTTOM 2 performing sectors (SHORT candidates):")
+        for rank_idx, etf_data in enumerate(etf_performance[-2:], 1):
             etf = etf_data['etf']
             holdings = sector_holdings.get(etf, [])[:3]  # Top 3 holdings
             if holdings:
                 rotation_picks.extend(holdings)
-                logger.info(f"Bottom sector {etf} ({etf_data['name']}, {etf_data['performance']:.2f}%): adding {holdings} (short candidates)")
+                logger.info(f"discovery |     #{rank_idx} {etf} ({etf_data['name']}, {etf_data['performance']:+.2f}%) → holdings: {holdings}")
+            else:
+                logger.info(f"discovery |     #{rank_idx} {etf} ({etf_data['name']}, {etf_data['performance']:+.2f}%) → no holdings available")
 
         # Remove duplicates while preserving order
         unique_picks = []
@@ -770,11 +1037,15 @@ def _get_sector_rotation_picks(db_path: str) -> List[str]:
                 unique_picks.append(ticker)
                 seen.add(ticker)
 
-        logger.info(f"Sector rotation picks from {len(etf_performance)} ETFs: {unique_picks}")
+        if unique_picks:
+            logger.info(f"discovery |   ✓ Sector rotation picked {len(unique_picks)} unique tickers: {unique_picks}")
+        else:
+            logger.info(f"discovery |   ✓ Sector rotation: no tickers selected (no holdings data available)")
+
         return unique_picks
 
     except Exception as e:
-        logger.error(f"Sector rotation analysis failed: {e}")
+        logger.error(f"discovery | Sector rotation analysis failed: {e}")
         return []
 
 
@@ -810,11 +1081,11 @@ def _get_existing_positions() -> List[str]:
     try:
         # For now, return empty list as Alpaca integration isn't fully implemented
         # In production, this would use alpaca_trade_api
-        logger.info("Alpaca positions query not implemented yet - returning empty list")
+        logger.info("discovery | Alpaca positions query not implemented yet - returning empty list")
         return []
 
     except Exception as e:
-        logger.error(f"Failed to get existing positions: {e}")
+        logger.error(f"discovery | Failed to get existing positions: {e}")
         return []
 
 
@@ -846,13 +1117,15 @@ def _get_user_watchlist() -> List[str]:
     """
     watchlist_str = os.getenv('WATCHLIST', '')
     if not watchlist_str:
+        logger.debug("discovery | WATCHLIST env var not set or empty")
         return []
 
     # Parse comma-separated list and clean up
-    tickers = [ticker.strip().upper() for ticker in watchlist_str.split(',')]
+    raw_tickers = watchlist_str.split(',')
+    tickers = [ticker.strip().upper() for ticker in raw_tickers]
     tickers = [ticker for ticker in tickers if ticker]  # Remove empty strings
 
-    logger.info(f"User watchlist: {tickers}")
+    logger.debug(f"discovery | Parsed WATCHLIST env var: {len(raw_tickers)} entries → {len(tickers)} valid tickers: {tickers}")
     return tickers
 
 
@@ -902,12 +1175,17 @@ def _validate_ticker(ticker: str, db_path: str) -> bool:
         True if ticker passes all validation criteria, False otherwise
     """
     if not ticker or len(ticker) > 5:
+        logger.debug(f"discovery |     ✗ {ticker}: malformed ticker")
         return False
 
     try:
         # Check cache first
         cached_result = _get_cached_validation(ticker, db_path)
         if cached_result is not None:
+            if cached_result:
+                logger.debug(f"discovery |     ✓ {ticker}: cached valid")
+            else:
+                logger.debug(f"discovery |     ✗ {ticker}: cached invalid")
             return cached_result
 
         # Fetch from yfinance
@@ -916,33 +1194,45 @@ def _validate_ticker(ticker: str, db_path: str) -> bool:
 
         # Check if ticker exists and has valid data
         if not info or info.get('regularMarketPrice') is None:
+            logger.debug(f"discovery |     ✗ {ticker}: no price data (invalid/delisted)")
             _cache_validation(ticker, False, db_path)
             return False
 
         # Check price >= $5
         price = info.get('regularMarketPrice', 0)
         if price < 5.0:
+            logger.debug(f"discovery |     ✗ {ticker}: penny stock (${price:.2f})")
             _cache_validation(ticker, False, db_path)
             return False
 
         # Check market cap >= $1B
         market_cap = info.get('marketCap', 0)
         if market_cap < 1_000_000_000:
+            market_cap_b = market_cap / 1_000_000_000 if market_cap > 0 else 0
+            logger.debug(f"discovery |     ✗ {ticker}: micro-cap (${market_cap_b:.2f}B)")
             _cache_validation(ticker, False, db_path)
             return False
 
         # Check volume >= 500K (use average volume)
         avg_volume = info.get('averageVolume', 0)
         if avg_volume < 500_000:
+            logger.debug(f"discovery |     ✗ {ticker}: illiquid ({avg_volume:,.0f} avg vol)")
             _cache_validation(ticker, False, db_path)
             return False
+
+        # All checks passed
+        sector = info.get('sector', 'Unknown')
+        price_str = f"${price:.2f}"
+        market_cap_b = market_cap / 1_000_000_000 if market_cap > 0 else 0
+        vol_str = f"{avg_volume:,.0f}"
+        logger.debug(f"discovery |     ✓ {ticker}: VALID ({price_str}, ${market_cap_b:.1f}B cap, {vol_str} vol, {sector})")
 
         # Cache positive result
         _cache_validation(ticker, True, db_path, sector=info.get('sector'))
         return True
 
     except Exception as e:
-        logger.debug(f"Validation failed for {ticker}: {e}")
+        logger.debug(f"discovery |     ✗ {ticker}: validation error - {e}")
         _cache_validation(ticker, False, db_path)
         return False
 
@@ -995,6 +1285,11 @@ def _prioritize_and_cap(ticker_sources: Dict[str, List[str]], max_tickers: int) 
         else:
             capped_candidates[ticker] = sources
 
+    logger.debug(f"discovery |   Always include (exempt from cap): {len(always_include)} tickers")
+    if always_include:
+        for ticker, sources in always_include.items():
+            logger.debug(f"discovery |     • {ticker}: {', '.join(sources)}")
+
     # Calculate priority score for remaining tickers
     scored_tickers = []
     for ticker, sources in capped_candidates.items():
@@ -1004,18 +1299,27 @@ def _prioritize_and_cap(ticker_sources: Dict[str, List[str]], max_tickers: int) 
     # Sort by score (descending)
     scored_tickers.sort(reverse=True)
 
+    logger.debug(f"discovery |   Candidates for capping (max {max_tickers}): {len(scored_tickers)} tickers")
+    if scored_tickers:
+        logger.debug(f"discovery |     Priority ranking (by source count):")
+        for score, ticker, sources in scored_tickers:
+            logger.debug(f"discovery |       [{score} sources] {ticker}: {', '.join(sources)}")
+
     # Take top tickers up to remaining capacity
     remaining_slots = max_tickers - len(always_include)
     final_sources = always_include.copy()
 
+    selected_from_cap = []
     for i, (score, ticker, sources) in enumerate(scored_tickers):
         if i < remaining_slots:
             final_sources[ticker] = sources
+            selected_from_cap.append(ticker)
         else:
+            logger.debug(f"discovery |       (capacity reached) excluded {len(scored_tickers) - remaining_slots} lower-priority tickers")
             break
 
-    logger.info(f"Prioritized and capped: {len(always_include)} always included, "
-                f"{len(final_sources) - len(always_include)} from discovery")
+    total_selected = len(always_include) + len(selected_from_cap)
+    logger.info(f"discovery |   Prioritization complete: {len(always_include)} always-include + {len(selected_from_cap)} from cap = {total_selected} total")
 
     return final_sources
 
@@ -1097,7 +1401,7 @@ def get_sector(ticker: str, db_path: str = "trader.db") -> Optional[str]:
         return sector
 
     except Exception as e:
-        logger.debug(f"Failed to get sector for {ticker}: {e}")
+        logger.debug(f"discovery | Failed to get sector for {ticker}: {e}")
         return None
 
 
@@ -1292,7 +1596,7 @@ def _cache_validation(ticker: str, is_valid: bool, db_path: str, sector: str = N
         conn.close()
 
     except Exception as e:
-        logger.debug(f"Failed to cache validation for {ticker}: {e}")
+        logger.debug(f"discovery | Failed to cache validation for {ticker}: {e}")
 
 
 def _log_discovery_cycle(db_path: str, cycle_id: str, result: Dict):
@@ -1349,7 +1653,7 @@ def _log_discovery_cycle(db_path: str, cycle_id: str, result: Dict):
         conn.close()
 
     except Exception as e:
-        logger.error(f"Failed to log discovery cycle: {e}")
+        logger.error(f"discovery | Failed to log discovery cycle: {e}")
 
 
 class DiscoveryError(Exception):

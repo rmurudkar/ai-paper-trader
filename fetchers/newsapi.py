@@ -7,6 +7,7 @@ import requests
 from datetime import datetime
 from typing import List, Dict, Union, Set, Tuple
 from dotenv import load_dotenv
+from . import groq_client
 
 # Load environment variables
 load_dotenv()
@@ -159,25 +160,37 @@ def _calculate_confidence(text: str, tickers: Set[str]) -> float:
 def _enhance_articles_with_tickers(articles: List[Dict]) -> List[Dict]:
     """Add ticker extraction to articles for discovery feedback.
 
+    Uses regex patterns first, then supplements with Groq Llama 3.1 8B
+    for company name recognition (e.g., "Apple" → AAPL).
+
     Args:
         articles: List of article dicts from NewsAPI
 
     Returns:
         Articles enhanced with ticker extraction data
     """
+    # First pass: regex extraction per article
     enhanced = []
-
     for article in articles:
-        # Extract tickers from title and snippet
         text = f"{article.get('title', '')} {article.get('snippet', '')}"
         extracted_tickers = extract_tickers_from_text(text)
 
-        # Create enhanced article with ticker information
         enhanced_article = {**article}
         enhanced_article['tickers'] = list(extracted_tickers)
         enhanced_article['extraction_confidence'] = _calculate_confidence(text, extracted_tickers)
-
         enhanced.append(enhanced_article)
+
+    # Second pass: Groq-powered company name extraction across all articles
+    if groq_client.is_available():
+        groq_results = groq_client.extract_tickers_batch(articles)
+        for ticker, article_indices in groq_results.items():
+            for idx in article_indices:
+                if idx < len(enhanced) and ticker not in enhanced[idx]['tickers']:
+                    enhanced[idx]['tickers'].append(ticker)
+                    # Boost confidence since AI confirmed a company mention
+                    enhanced[idx]['extraction_confidence'] = min(
+                        1.0, enhanced[idx]['extraction_confidence'] + 0.3
+                    )
 
     return enhanced
 
@@ -356,16 +369,23 @@ def _parse_articles(response_json: Dict, topic_name: str) -> List[Dict]:
     articles = []
     results = response_json.get('articles', {}).get('results', [])
 
-    for article in results:
+    logger.info(f"NewsAPI.ai | Parsing {len(results)} articles for topic '{topic_name}'")
+
+    for i, article in enumerate(results):
         title = article.get('title', '')
         url = article.get('url', '')
 
         if not title or not url:
+            logger.debug(f"NewsAPI.ai | Skipping article {i+1}: missing title or URL")
             continue
 
         body = article.get('body', '')
         snippet = body[:SNIPPET_MAX_CHARS].strip() if body else ''
         published_at = article.get('publishedDate', article.get('date', ''))
+
+        logger.debug(f"NewsAPI.ai | Article {i+1} [{topic_name}]: {title[:60]}...")
+        if snippet:
+            logger.debug(f"NewsAPI.ai |   Body preview: {snippet[:80]}...")
 
         articles.append({
             'title': title,
@@ -379,4 +399,5 @@ def _parse_articles(response_json: Dict, topic_name: str) -> List[Dict]:
             'extraction_confidence': 0.0
         })
 
+    logger.info(f"NewsAPI.ai | ✓ Parsed {len(articles)} valid articles from topic '{topic_name}'")
     return articles

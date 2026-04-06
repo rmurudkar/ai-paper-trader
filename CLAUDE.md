@@ -13,6 +13,7 @@ Uses paper trading only — no real money trades.
 - Alpaca SDK (paper trading + portfolio state)
 - Marketaux API (stock-tagged financial news + pre-built sentiment)
 - NewsAPI.ai (macro, geopolitical, economic news)
+- Groq Llama 3.1 8B (company name → ticker extraction via REST API)
 - yfinance (price, volume, moving averages, VIX, yield data)
 - trafilatura (primary article scraper)
 - newspaper3k (fallback article scraper)
@@ -29,6 +30,7 @@ paper-trader/
 │   └── loop.py              # APScheduler event loop, market hours awareness
 ├── fetchers/
 │   ├── discovery.py         # Dynamic ticker discovery from news + gainers/losers
+│   ├── groq_client.py       # Groq Llama 3.1 8B for company name → ticker extraction
 │   ├── marketaux.py         # Marketaux API client
 │   ├── newsapi.py           # NewsAPI.ai client + scraper
 │   ├── scraper.py           # Full article text extractor
@@ -65,6 +67,7 @@ ALPACA_SECRET_KEY=
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
 MARKETAUX_API_KEY=
 NEWSAPI_AI_KEY=
+GROQ_API_KEY=              # optional: Groq free tier for company name extraction (sign up at console.groq.com)
 TURSO_CONNECTION_URL=libsql://your-database-name-random.turso.io
 TURSO_AUTH_TOKEN=
 TICKER_MODE=discovery      # "watchlist" = trade only user-defined tickers, "discovery" = find tickers from news + market scans
@@ -99,7 +102,10 @@ Determines which tickers the system should analyze this cycle. Supports two mode
 **Mode: "discovery" (default)**
 The system finds its own tickers every cycle. Sources, in priority order:
 
-1. **News-driven discovery**: Scan Marketaux and NewsAPI results for ticker mentions before filtering. Extract every ticker symbol mentioned in headlines and article bodies. Any ticker with 2+ mentions across sources in the last 4 hours gets added to the active set.
+1. **News-driven discovery**: Scan Marketaux and NewsAPI results for ticker mentions before filtering. Extract ticker symbols via:
+   - **Regex patterns** (always): $AAPL, (NASDAQ:AAPL), standalone ticker symbols
+   - **Groq Llama 3.1 8B** (if GROQ_API_KEY set): Company name recognition (e.g., "Apple" → AAPL, "Nvidia" → NVDA)
+   - Any ticker with 2+ mentions across sources in the last 4 hours gets added to the active set. Groq extraction catches company names without explicit ticker symbols, improving discovery coverage.
 
 2. **Market movers**: Use yfinance to fetch today's top gainers and losers from the S&P 500. Add the top 5 gainers and top 5 losers — these are where momentum and mean reversion signals are most likely to fire.
 
@@ -126,6 +132,29 @@ The system finds its own tickers every cycle. Sources, in priority order:
 
 **Important**: The discovery module runs FIRST in every cycle, before any fetcher or strategy. All downstream modules receive the active ticker list from discovery — they never hardcode tickers.
 
+### 2.5 fetchers/groq_client.py — Groq Llama 3.1 8B Company Name Extraction
+**Optional** — requires `GROQ_API_KEY` (free tier: 500K tokens/day, 14,400 requests/day)
+
+Provides reusable AI-powered company name → ticker resolution:
+- Extracts company names from article text and resolves to US stock ticker symbols
+- Used by `discovery.py` to enhance news-driven ticker discovery
+- Used by `newsapi.py` to tag macro articles with relevant company mentions
+- Supplements regex pattern matching (catches "Apple Inc" → AAPL, "Nvidia" → NVDA, etc.)
+- Graceful fallback: if GROQ_API_KEY not set, system continues with regex-only extraction
+
+**Functions**:
+- `extract_tickers_from_text(text)` — Extract company names from single article
+- `extract_tickers_batch(articles)` — Batch process multiple articles
+- `get_ticker_symbols(articles)` — Convenience function returning ticker set
+- `is_available()` — Check if GROQ_API_KEY configured
+
+**Setup**:
+1. Sign up at [console.groq.com](https://console.groq.com)
+2. Create API key
+3. Add `GROQ_API_KEY=gsk_your_key_here` to `.env`
+
+**Cost**: Free tier covers 99% of typical usage (small personal trading bot at ~100 articles/day = ~10% of free allowance)
+
 ### 3. fetchers/marketaux.py — Marketaux News
 - In discovery mode: fetch broad financial news (no ticker filter), return ALL articles with ticker tags
 - In watchlist mode: fetch news filtered to watchlist tickers only
@@ -137,8 +166,12 @@ The system finds its own tickers every cycle. Sources, in priority order:
 - Fetch macro/geopolitical/economic headlines from NewsAPI.ai
 - In discovery mode: fetch broadly, let discovery.py extract tickers from results
 - In watchlist mode: filter by relevance to watchlist before scraping
+- Per-article ticker tagging:
+  - **Regex extraction** (always): extract symbols from title/snippet
+  - **Groq enhancement** (if GROQ_API_KEY set): supplement with company name recognition
+  - Tickers are tagged on each article for discovery feedback
 - Pass relevant URLs to fetchers/scraper.py for full text
-- Returns: list of `{title, full_text, topics, url, published_at, source:"newsapi"}`
+- Returns: list of `{title, full_text, topics, url, published_at, source:"newsapi", tickers: [...], extraction_confidence: 0.0-1.0}`
 
 ### 5. fetchers/scraper.py — Article Scraper
 - Primary: `trafilatura.fetch_url()` + `trafilatura.extract()`
@@ -529,6 +562,9 @@ CREATE TABLE discovery_log (
 - ALWAYS run discovery.py as the FIRST step in every trading cycle
 - ALWAYS look up sector via yfinance for any newly discovered ticker and cache it in Turso
 - One ticker at a time through the signal engine — no batch parallelism yet
+- Groq company name extraction is OPTIONAL: gracefully degrade to regex-only if GROQ_API_KEY not set
+- NEVER rely solely on Groq for ticker extraction — always combine with regex patterns
+- ALWAYS truncate article text to 1500 chars before sending to Groq (cost optimization)
 
 ## Ticker Modes
 **watchlist** — User provides a fixed list of tickers in `WATCHLIST` env var. System only analyzes and trades these tickers. Lower API usage, predictable behavior.
