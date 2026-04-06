@@ -50,6 +50,12 @@ CREATE TABLE IF NOT EXISTS sector_cache (
     fetched_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sp500_cache (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    tickers TEXT NOT NULL,          -- JSON array of ticker symbols
+    fetched_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS discovery_log (
     cycle_id TEXT NOT NULL,
     ticker TEXT NOT NULL,

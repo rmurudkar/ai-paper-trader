@@ -407,6 +407,43 @@ def reset_circuit_breaker() -> None:
 
 
 # ============================================================================
+# S&P 500 CACHE UTILITIES
+# ============================================================================
+
+
+def get_cached_sp500() -> Optional[List[str]]:
+    """Return the last successfully fetched S&P 500 ticker list, or None if never cached."""
+    try:
+        db = get_db()
+        result = db.execute("SELECT tickers FROM sp500_cache WHERE id = 1")
+        if result.rows:
+            return json.loads(result.rows[0][0])
+    except Exception as e:
+        logger.warning(f"Could not read sp500_cache: {e}")
+    return None
+
+
+def save_sp500_cache(tickers: List[str]) -> None:
+    """Persist the S&P 500 ticker list to Turso for use as a fallback."""
+    try:
+        db = get_db()
+        now = datetime.utcnow().isoformat() + "Z"
+        db.execute(
+            """
+            INSERT INTO sp500_cache (id, tickers, fetched_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                tickers = excluded.tickers,
+                fetched_at = excluded.fetched_at
+            """,
+            [json.dumps(tickers), now],
+        )
+        logger.debug(f"Saved {len(tickers)} S&P 500 tickers to cache")
+    except Exception as e:
+        logger.warning(f"Could not save sp500_cache: {e}")
+
+
+# ============================================================================
 # DISCOVERY LOG UTILITIES
 # ============================================================================
 

@@ -38,6 +38,8 @@ import requests
 from datetime import datetime, timedelta
 import time
 
+from db.client import get_cached_sp500, save_sp500_cache
+
 logger = logging.getLogger(__name__)
 
 # Sector ETFs for rotation scanning
@@ -156,12 +158,19 @@ def fetch_sp500_tickers() -> List[str]:
         tickers = [t for t in tickers if t]  # Remove any None values
 
         logger.info(f"Successfully fetched {len(tickers)} S&P 500 tickers from Wikipedia")
+        save_sp500_cache(tickers)
         return sorted(tickers)
 
     except Exception as e:
         logger.error(f"Failed to fetch S&P 500 from Wikipedia: {e}")
 
-        # Fallback: Static list of major S&P 500 companies
+        # Fallback 1: Last successful fetch from Turso cache
+        cached = get_cached_sp500()
+        if cached:
+            logger.info(f"Using cached S&P 500 list ({len(cached)} tickers)")
+            return cached
+
+        # Fallback 2: Static list of major S&P 500 companies
         logger.info("Using static fallback S&P 500 list...")
         return _get_fallback_sp500_list()
 
