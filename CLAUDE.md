@@ -12,6 +12,7 @@ Uses paper trading only — no real money trades.
 - Anthropic SDK (sentiment engine + macro regime classification)
 - Alpaca SDK (paper trading + portfolio state)
 - Marketaux API (stock-tagged financial news + pre-built sentiment)
+- Massive API (ticker-tagged financial news + built-in sentiment)
 - NewsAPI.ai (macro, geopolitical, economic news)
 - Groq Llama 3.1 8B (company name → ticker extraction via REST API)
 - yfinance (price, volume, moving averages, VIX, yield data)
@@ -32,6 +33,7 @@ paper-trader/
 │   ├── discovery.py         # Dynamic ticker discovery from news + gainers/losers
 │   ├── groq_client.py       # Groq Llama 3.1 8B for company name → ticker extraction
 │   ├── marketaux.py         # Marketaux API client
+│   ├── massive.py           # Massive API client (ticker-tagged news + sentiment)
 │   ├── newsapi.py           # NewsAPI.ai client + scraper
 │   ├── scraper.py           # Full article text extractor
 │   ├── market.py            # yfinance price/volume/MA/RSI data
@@ -68,6 +70,7 @@ ALPACA_BASE_URL=https://paper-api.alpaca.markets
 MARKETAUX_API_KEY=
 NEWSAPI_AI_KEY=
 GROQ_API_KEY=              # optional: Groq free tier for company name extraction (sign up at console.groq.com)
+MASSIVE_API_KEY=           # optional: Massive API for ticker-tagged news (sign up at massive.com)
 TURSO_CONNECTION_URL=libsql://your-database-name-random.turso.io
 TURSO_AUTH_TOKEN=
 TICKER_MODE=discovery      # "watchlist" = trade only user-defined tickers, "discovery" = find tickers from news + market scans
@@ -162,6 +165,17 @@ Provides reusable AI-powered company name → ticker resolution:
 - DO NOT re-analyze Marketaux sentiment with Claude — use it directly
 - Returns: list of `{title, ticker, sentiment_score, snippet, url, published_at, source:"marketaux"}`
 
+### 3.5. fetchers/massive.py — Massive News
+- Ticker-tagged financial news with built-in sentiment analysis (similar to Marketaux)
+- Optional — requires `MASSIVE_API_KEY` in `.env` (sign up at massive.com)
+- Returns articles with pre-tagged ticker symbols and sentiment scores
+- Sentiment derived from Massive `insights` array: positive → 0.7, negative → -0.7, neutral → 0.0
+- DO NOT re-analyze Massive sentiment with Claude — use it directly (same rule as Marketaux)
+- Graceful fallback: if `MASSIVE_API_KEY` not set, aggregator skips this source
+- In discovery mode: fetch broad news (no ticker filter), return ALL articles with ticker tags
+- In watchlist mode: fetch news filtered to provided tickers only
+- Returns: list of `{title, description, tickers, sentiment_score, url, published_at, author, source:"massive"}`
+
 ### 4. fetchers/newsapi.py — NewsAPI Macro/Geopolitical News
 - Fetch macro/geopolitical/economic headlines from NewsAPI.ai
 - In discovery mode: fetch broadly, let discovery.py extract tickers from results
@@ -189,13 +203,15 @@ Provides reusable AI-powered company name → ticker resolution:
 - Returns: dict keyed by ticker symbol + macro indicators dict
 
 ### 7. fetchers/aggregator.py — Dedup & Merge
-- Merge Marketaux + NewsAPI outputs
-- Deduplicate by URL exact match, then by title similarity (>80% match = duplicate)
-- Tag each item: source = "marketaux" | "newsapi"
+- Merge Marketaux + Massive + NewsAPI + Alpaca News outputs
+- 4-step waterfall enrichment for NewsAPI articles (Polygon → Alpaca → scraper → snippet-only)
+- Deduplicate by URL exact match, then by title similarity (>80% Jaccard match = duplicate)
+- Tag each item: source = "marketaux" | "massive" | "newsapi" | "alpaca" | "polygon"
 - Returns: unified list sorted by published_at desc
 
 ### 8. engine/sentiment.py — Claude Sentiment Engine
 - Marketaux items: pass sentiment_score directly, skip Claude call
+- Massive items: pass sentiment_score directly, skip Claude call (same as Marketaux)
 - NewsAPI items: send full_text (not headline) to Claude for analysis
 - Claude prompt: analyze sentiment as it relates to specific tickers
 - Returns: sentiment score -1.0 to 1.0 per ticker per article
@@ -545,7 +561,7 @@ CREATE TABLE discovery_log (
 
 ## Key Rules for Claude Code
 - NEVER send raw headlines to Claude for sentiment — always use full_text
-- NEVER re-analyze Marketaux sentiment scores — they are pre-computed and trusted
+- NEVER re-analyze Marketaux or Massive sentiment scores — they are pre-computed and trusted
 - NEVER scrape paywalled domains: wsj.com, ft.com, bloomberg.com, nytimes.com
 - ALWAYS truncate article text to 1200 words before sending to Claude
 - ALWAYS deduplicate before analysis — never analyze the same article twice

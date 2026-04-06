@@ -11,12 +11,20 @@ Deduplicate: exact URL match first, then title similarity > 80%
 Sort by published_at descending
 """
 
-from typing import List, Dict, Literal
-from . import marketaux, newsapi, polygon, alpaca_news, scraper, market
+import logging
+from datetime import datetime
+from typing import List, Dict
+
+from . import marketaux, massive, newsapi, polygon, alpaca_news, scraper
+
+logger = logging.getLogger(__name__)
+
+TITLE_SIMILARITY_THRESHOLD = 0.80
 
 
 def fetch_all_news(
     max_marketaux: int = 20,
+    max_massive: int = 50,
     max_newsapi: int = 15,
     max_polygon: int = 20,
     max_alpaca: int = 15,
@@ -27,19 +35,15 @@ def fetch_all_news(
 
     Flow:
     1. Call marketaux.fetch_news(watchlist) for ticker-tagged news with sentiment scores
-    2. Call newsapi.fetch_headlines() for macro/geopolitical headlines
-    3. Call alpaca_news.fetch_news(watchlist) for Benzinga feed
-    4. Apply 4-step waterfall enrichment to NewsAPI articles
-    5. Merge all sources and deduplicate
-
-    WATERFALL ENRICHMENT for NewsAPI.ai articles:
-    1. polygon.fetch_full_text(url) → enrich + partial:false
-    2. alpaca_news.fetch_news() lookup → enrich + partial:false
-    3. scraper.scrape(url) fallback → enrich + partial:false
-    4. snippet only → partial:true (limited analysis)
+    2. Call massive.fetch_news(tickers) for ticker-tagged news with sentiment
+    3. Call newsapi.fetch_headlines() for macro/geopolitical headlines
+    4. Call alpaca_news.fetch_news(watchlist) for Benzinga feed
+    5. Apply 4-step waterfall enrichment to NewsAPI articles
+    6. Merge all sources and deduplicate
 
     Args:
         max_marketaux: Maximum articles from marketaux.fetch_news().
+        max_massive: Maximum articles from massive.fetch_news().
         max_newsapi: Maximum articles from newsapi.fetch_headlines().
         max_polygon: Not used directly (called via fetch_full_text).
         max_alpaca: Maximum articles from alpaca_news.fetch_news().
@@ -47,13 +51,72 @@ def fetch_all_news(
         discovery_context: Discovery context from discovery.py containing mode and tickers.
 
     Returns:
-        Unified list sorted by published_at desc with partial flag:
-        - Marketaux: title, ticker, sentiment_score, snippet, url, published_at, source
-        - NewsAPI: title, full_text/snippet, topics, url, published_at, source, partial:bool
-        - Polygon: title, full_text, publisher, published_at, tickers, url, source, partial:false
-        - Alpaca: title, full_text, ticker, url, published_at, source, partial:false
+        Unified list sorted by published_at desc with partial flag.
     """
-    pass
+    # Determine effective tickers from discovery context or watchlist
+    effective_tickers = watchlist or []
+    if discovery_context:
+        effective_tickers = discovery_context.get('tickers', effective_tickers)
+
+    is_discovery = bool(discovery_context and discovery_context.get('mode') == 'discovery')
+
+    # 1. Fetch from all sources
+    logger.info("Fetching Marketaux news...")
+    marketaux_articles = _safe_fetch(
+        lambda: marketaux.fetch_news(
+            tickers=effective_tickers,
+            max_results=max_marketaux,
+            broad=is_discovery
+        ),
+        "Marketaux"
+    )
+
+    logger.info("Fetching Massive news...")
+    massive_articles = _safe_fetch(
+        lambda: massive.fetch_news(
+            tickers=effective_tickers or None,
+            max_results=max_massive
+        ),
+        "Massive"
+    )
+
+    logger.info("Fetching NewsAPI headlines...")
+    newsapi_articles = _safe_fetch(
+        lambda: newsapi.fetch_headlines(
+            max_results=max_newsapi,
+            discovery_context=discovery_context,
+            watchlist=effective_tickers,
+            broad=is_discovery
+        ),
+        "NewsAPI"
+    )
+
+    logger.info("Fetching Alpaca news...")
+    alpaca_articles = _safe_fetch(
+        lambda: alpaca_news.fetch_news(
+            watchlist=effective_tickers or ['SPY'],
+            max_results=max_alpaca
+        ),
+        "Alpaca News"
+    )
+
+    # 2. Waterfall enrichment for NewsAPI articles
+    logger.info(f"Enriching {len(newsapi_articles)} NewsAPI articles via waterfall...")
+    enriched_newsapi = waterfall_enrich_newsapi(newsapi_articles, alpaca_articles)
+
+    # 3. Merge and deduplicate (Massive included as a ticker-tagged source alongside Marketaux)
+    merged = merge_sources(
+        marketaux_articles, enriched_newsapi, [], alpaca_articles,
+        massive_articles=massive_articles
+    )
+
+    logger.info(
+        f"Aggregator complete: {len(marketaux_articles)} marketaux, "
+        f"{len(massive_articles)} massive, {len(newsapi_articles)} newsapi, "
+        f"{len(alpaca_articles)} alpaca → {len(merged)} after dedup"
+    )
+
+    return merged
 
 
 def deduplicate_articles(articles: List[Dict]) -> List[Dict]:
@@ -63,17 +126,58 @@ def deduplicate_articles(articles: List[Dict]) -> List[Dict]:
     1. URL exact match = duplicate (remove)
     2. Title similarity >80% = duplicate (remove)
 
+    When duplicates are found, keep the article with more content (full_text over snippet).
+
     Args:
         articles: List of article dicts from various sources.
 
     Returns:
         Deduplicated list of article dicts.
     """
-    pass
+    if not articles:
+        return []
+
+    unique = []
+    seen_urls = set()
+
+    for article in articles:
+        url = article.get('url', '')
+
+        # Step 1: exact URL match
+        if url and url in seen_urls:
+            continue
+
+        # Step 2: title similarity check against already-kept articles
+        title = article.get('title', '')
+        is_dup = False
+        if title:
+            for kept in unique:
+                kept_title = kept.get('title', '')
+                if kept_title and calculate_title_similarity(title, kept_title) > TITLE_SIMILARITY_THRESHOLD:
+                    # Keep whichever has more content
+                    if article.get('full_text') and not kept.get('full_text'):
+                        unique.remove(kept)
+                        if kept.get('url'):
+                            seen_urls.discard(kept['url'])
+                        break  # will add current article below
+                    else:
+                        is_dup = True
+                        break
+
+        if is_dup:
+            continue
+
+        if url:
+            seen_urls.add(url)
+        unique.append(article)
+
+    return unique
 
 
 def calculate_title_similarity(title1: str, title2: str) -> float:
-    """Calculate similarity score between two article titles.
+    """Calculate Jaccard similarity between two article titles.
+
+    Uses word-level Jaccard index: |intersection| / |union|.
 
     Args:
         title1: First article title.
@@ -82,96 +186,244 @@ def calculate_title_similarity(title1: str, title2: str) -> float:
     Returns:
         Similarity score between 0.0 and 1.0.
     """
-    pass
+    if not title1 or not title2:
+        return 0.0
+
+    words1 = set(title1.lower().split())
+    words2 = set(title2.lower().split())
+
+    if not words1 or not words2:
+        return 0.0
+
+    intersection = words1 & words2
+    union = words1 | words2
+
+    return len(intersection) / len(union)
 
 
 def merge_sources(
     marketaux_articles: List[Dict],
     newsapi_articles: List[Dict],
     polygon_articles: List[Dict],
-    alpaca_articles: List[Dict]
+    alpaca_articles: List[Dict],
+    massive_articles: List[Dict] = None
 ) -> List[Dict]:
-    """Merge articles from all 4 sources and apply deduplication.
+    """Merge articles from all sources and apply deduplication.
 
     Args:
         marketaux_articles: Articles from Marketaux API.
-        newsapi_articles: Articles from NewsAPI.ai.
-        polygon_articles: Articles from Polygon.io.
+        newsapi_articles: Articles from NewsAPI.ai (already enriched).
+        polygon_articles: Articles from Polygon.io feed.
         alpaca_articles: Articles from Alpaca News.
+        massive_articles: Articles from Massive API.
 
     Returns:
         Merged and deduplicated list sorted by published_at desc.
     """
-    pass
+    all_articles = []
+    all_articles.extend(marketaux_articles)
+    if massive_articles:
+        all_articles.extend(massive_articles)
+    all_articles.extend(newsapi_articles)
+    all_articles.extend(polygon_articles)
+    all_articles.extend(alpaca_articles)
+
+    deduped = deduplicate_articles(all_articles)
+    return sort_by_published_date(deduped)
 
 
-def waterfall_enrich_newsapi(newsapi_articles: List[Dict]) -> List[Dict]:
+def waterfall_enrich_newsapi(
+    newsapi_articles: List[Dict],
+    alpaca_articles: List[Dict] = None
+) -> List[Dict]:
     """4-step waterfall enrichment for NewsAPI.ai articles.
 
     For each NewsAPI.ai article with needs_full_text=True:
     Step 1: Call polygon.fetch_full_text(url) → if found, enrich + partial:false
-    Step 2: Look up full text in alpaca_news.fetch_news() → if found, enrich + partial:false
+    Step 2: Look up full text in alpaca_articles by title match → if found, enrich + partial:false
     Step 3: Call scraper.scrape(url) fallback → if found, enrich + partial:false
     Step 4: Use snippet only → partial:true (flag for limited analysis)
 
     Args:
         newsapi_articles: Articles from NewsAPI.ai with needs_full_text=True.
+        alpaca_articles: Pre-fetched Alpaca articles for title matching.
 
     Returns:
         Enhanced NewsAPI articles with full_text or snippet + partial flag.
-        partial=True means limited to snippet only
-        partial=False means full text obtained via steps 1-3
     """
-    pass
+    if not newsapi_articles:
+        return []
+
+    enriched = list(newsapi_articles)
+
+    # Step 1: Polygon full text lookup
+    enriched = enrich_newsapi_with_polygon(enriched)
+    remaining = sum(1 for a in enriched if a.get('needs_full_text'))
+    logger.info(f"After Polygon enrichment: {remaining} articles still need full text")
+
+    # Step 2: Alpaca News title matching
+    enriched = enrich_newsapi_with_alpaca(enriched, alpaca_articles or [])
+    remaining = sum(1 for a in enriched if a.get('needs_full_text'))
+    logger.info(f"After Alpaca enrichment: {remaining} articles still need full text")
+
+    # Step 3: Scraper fallback
+    enriched = enrich_newsapi_with_scraper(enriched)
+    remaining = sum(1 for a in enriched if a.get('needs_full_text'))
+    logger.info(f"After scraper enrichment: {remaining} articles remain snippet-only")
+
+    # Step 4: Mark any remaining as partial
+    for article in enriched:
+        if article.get('needs_full_text'):
+            article['partial'] = True
+            article.pop('needs_full_text', None)
+
+    return enriched
 
 
 def enrich_newsapi_with_polygon(newsapi_articles: List[Dict]) -> List[Dict]:
     """Step 1: Enrich NewsAPI items via polygon.fetch_full_text(url).
 
-    For each NewsAPI article, call polygon.fetch_full_text(url) to get licensed text.
-    Update NewsAPI items with full_text from successful lookups.
-
     Args:
-        newsapi_articles: Articles from NewsAPI.ai with needs_full_text=True.
+        newsapi_articles: Articles from NewsAPI.ai.
 
     Returns:
-        Enhanced NewsAPI articles with full_text added where polygon lookup succeeded.
+        Articles with full_text added where Polygon lookup succeeded.
     """
-    pass
+    enriched = []
+    for article in newsapi_articles:
+        if not article.get('needs_full_text'):
+            enriched.append(article)
+            continue
+
+        url = article.get('url', '')
+        if not url:
+            enriched.append(article)
+            continue
+
+        try:
+            result = polygon.fetch_full_text(url)
+            if result and result.get('full_text'):
+                updated = article.copy()
+                updated['full_text'] = result['full_text']
+                updated['partial'] = False
+                updated.pop('needs_full_text', None)
+                # Merge any extra tickers from Polygon
+                existing_tickers = set(updated.get('tickers', []))
+                existing_tickers.update(result.get('tickers', []))
+                updated['tickers'] = list(existing_tickers)
+                enriched.append(updated)
+                logger.debug(f"Polygon enriched: {article.get('title', '')[:60]}")
+                continue
+        except Exception as e:
+            logger.warning(f"Polygon enrichment failed for {url}: {e}")
+
+        enriched.append(article)
+
+    return enriched
 
 
-def enrich_newsapi_with_alpaca(newsapi_articles: List[Dict]) -> List[Dict]:
-    """Step 2: Enrich NewsAPI items with Alpaca News full_text where available.
-
-    Match remaining NewsAPI articles with alpaca_news.fetch_news() by URL/headline.
-    Update NewsAPI items with full_text from matching Alpaca articles.
+def enrich_newsapi_with_alpaca(
+    newsapi_articles: List[Dict],
+    alpaca_articles: List[Dict] = None
+) -> List[Dict]:
+    """Step 2: Enrich NewsAPI items with Alpaca News full_text via title matching.
 
     Args:
         newsapi_articles: Articles from NewsAPI.ai still needing full_text.
+        alpaca_articles: Pre-fetched Alpaca articles to match against.
 
     Returns:
-        Enhanced NewsAPI articles with full_text added where matches found.
+        Articles with full_text added where title matches found.
     """
-    pass
+    if not alpaca_articles:
+        return newsapi_articles
+
+    enriched = []
+    for article in newsapi_articles:
+        if not article.get('needs_full_text'):
+            enriched.append(article)
+            continue
+
+        title = article.get('title', '')
+        url = article.get('url', '')
+        matched = False
+
+        for alpaca_art in alpaca_articles:
+            # Match by URL first
+            if url and alpaca_art.get('url') == url and alpaca_art.get('full_text'):
+                updated = article.copy()
+                updated['full_text'] = alpaca_art['full_text']
+                updated['partial'] = False
+                updated.pop('needs_full_text', None)
+                enriched.append(updated)
+                matched = True
+                logger.debug(f"Alpaca URL match: {title[:60]}")
+                break
+
+            # Match by title similarity
+            alpaca_title = alpaca_art.get('title', '')
+            if (title and alpaca_title
+                    and calculate_title_similarity(title, alpaca_title) > TITLE_SIMILARITY_THRESHOLD
+                    and alpaca_art.get('full_text')):
+                updated = article.copy()
+                updated['full_text'] = alpaca_art['full_text']
+                updated['partial'] = False
+                updated.pop('needs_full_text', None)
+                enriched.append(updated)
+                matched = True
+                logger.debug(f"Alpaca title match: {title[:60]}")
+                break
+
+        if not matched:
+            enriched.append(article)
+
+    return enriched
 
 
 def enrich_newsapi_with_scraper(newsapi_articles: List[Dict]) -> List[Dict]:
     """Step 3: Fallback scraper enrichment via scraper.scrape(url).
 
-    For articles still needing full_text after Polygon + Alpaca lookup.
-    Calls scraper.scrape(url) fallback for each remaining article.
-
     Args:
         newsapi_articles: Articles from NewsAPI.ai still needing full_text.
 
     Returns:
-        Enhanced articles with scraped full_text or snippet + partial:true.
+        Articles with scraped full_text or unchanged if scraping fails.
     """
-    pass
+    enriched = []
+    for article in newsapi_articles:
+        if not article.get('needs_full_text'):
+            enriched.append(article)
+            continue
+
+        url = article.get('url', '')
+        snippet = article.get('snippet', '')
+        if not url:
+            enriched.append(article)
+            continue
+
+        try:
+            result = scraper.scrape(url, snippet=snippet)
+            if result and result.get('full_text') and not result.get('partial', True):
+                updated = article.copy()
+                updated['full_text'] = result['full_text']
+                updated['partial'] = False
+                updated.pop('needs_full_text', None)
+                enriched.append(updated)
+                logger.debug(f"Scraper enriched: {article.get('title', '')[:60]}")
+                continue
+        except Exception as e:
+            logger.warning(f"Scraper enrichment failed for {url}: {e}")
+
+        enriched.append(article)
+
+    return enriched
 
 
 def sort_by_published_date(articles: List[Dict], descending: bool = True) -> List[Dict]:
     """Sort articles by published_at timestamp.
+
+    Handles multiple date formats gracefully. Articles without a parseable
+    date are placed at the end.
 
     Args:
         articles: List of article dicts with published_at field.
@@ -180,4 +432,35 @@ def sort_by_published_date(articles: List[Dict], descending: bool = True) -> Lis
     Returns:
         Sorted list of articles.
     """
-    pass
+    if not articles:
+        return []
+
+    def parse_date(article):
+        date_str = article.get('published_at', '')
+        if not date_str:
+            return datetime.min
+
+        for fmt in ('%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%SZ',
+                    '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+            try:
+                return datetime.strptime(date_str, fmt)
+            except (ValueError, TypeError):
+                continue
+
+        # If it's already a datetime object
+        if isinstance(date_str, datetime):
+            return date_str
+
+        return datetime.min
+
+    return sorted(articles, key=parse_date, reverse=descending)
+
+
+def _safe_fetch(fetch_fn, source_name: str) -> List[Dict]:
+    """Safely call a fetcher, returning empty list on failure."""
+    try:
+        result = fetch_fn()
+        return result if result else []
+    except Exception as e:
+        logger.error(f"{source_name} fetch failed: {e}")
+        return []

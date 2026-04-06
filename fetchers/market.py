@@ -262,18 +262,27 @@ def _process_ticker_data(ticker: str, hist: pd.DataFrame) -> Dict:
         current_volume = int(hist['Volume'].iloc[-1])
 
         # Moving averages
+        ma_20 = float(hist['Close'].rolling(20).mean().iloc[-1]) if len(hist) >= 20 else None
         ma_50 = float(hist['Close'].rolling(50).mean().iloc[-1]) if len(hist) >= 50 else None
         ma_200 = float(hist['Close'].rolling(200).mean().iloc[-1]) if len(hist) >= 200 else None
 
         # RSI calculation
         rsi = _calculate_rsi(hist['Close']) if len(hist) >= 15 else None
 
+        # Daily change percent and 20-day average volume (required by strategies)
+        prev_close = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else current_price
+        price_change_pct = ((current_price - prev_close) / prev_close) * 100 if prev_close else 0.0
+        avg_volume_20 = float(hist['Volume'].rolling(20).mean().iloc[-1]) if len(hist) >= 20 else float(current_volume)
+
         return {
             'price': current_price,
             'volume': current_volume,
+            'ma_20': ma_20,
             'ma_50': ma_50,
             'ma_200': ma_200,
             'rsi': rsi,
+            'price_change_pct': price_change_pct,
+            'avg_volume_20': avg_volume_20,
             'last_updated': datetime.now().isoformat() + 'Z'
         }
 
