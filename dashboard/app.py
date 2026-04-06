@@ -18,15 +18,26 @@ Run: streamlit run dashboard/app.py
 """
 
 import os
+import sys
 import json
 import logging
+from pathlib import Path
 from datetime import datetime, timezone
+
+# Ensure project root is in Python path for module imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from dotenv import load_dotenv
+
+from risk.manager import (
+    MAX_RISK_PER_TRADE, MAX_SHARES_PER_POSITION, MAX_PORTFOLIO_ALLOCATION,
+    MAX_SINGLE_TICKER_ALLOCATION, MAX_SECTOR_ALLOCATION, MAX_OPEN_POSITIONS,
+    MIN_STOCK_PRICE, MIN_MARKET_CAP, STOP_LOSS_PCT, TAKE_PROFIT_PCT,
+)
 
 load_dotenv()
 
@@ -841,11 +852,7 @@ def main():
 
         st.divider()
         st.subheader("Risk Parameters")
-        from risk.manager import (
-            MAX_RISK_PER_TRADE, MAX_SHARES_PER_POSITION, MAX_PORTFOLIO_ALLOCATION,
-            MAX_SINGLE_TICKER_ALLOCATION, MAX_SECTOR_ALLOCATION, MAX_OPEN_POSITIONS,
-            MIN_STOCK_PRICE, MIN_MARKET_CAP, STOP_LOSS_PCT, TAKE_PROFIT_PCT,
-        )
+        
         params = pd.DataFrame([
             {"Parameter": "Max Risk Per Trade", "Value": f"{MAX_RISK_PER_TRADE:.0%}"},
             {"Parameter": "Max Shares Per Position", "Value": str(MAX_SHARES_PER_POSITION)},

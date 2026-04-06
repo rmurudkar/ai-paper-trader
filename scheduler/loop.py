@@ -1,338 +1,588 @@
 """APScheduler event loop for autonomous paper trading system.
 
-This module orchestrates the entire trading pipeline on market-aware schedules.
-It is the entry point that coordinates all other modules in the correct sequence
-and ensures trading only occurs during appropriate market conditions.
-
-CRITICAL ARCHITECTURE NOTE:
-===========================
-This is the MASTER COORDINATOR for the entire system. It runs discovery first,
-then passes discovered tickers to all downstream modules. No other module should
-run independently - everything flows through this scheduler.
-
-Schedule Overview:
-=================
-- **Primary job**: Every 15 minutes during market hours (9:30 AM – 4:00 PM ET)
-  Full trading cycle: discovery → sentiment → strategies → combiner → risk → execution
-
-- **Pre-market job**: Once at 9:00 AM ET
-  Overnight news processing and sector rotation analysis for market open
-
-- **Post-market job**: Once at 4:30 PM ET
-  Daily P&L calculation and feedback loop execution
-
-- **Weekend/holiday**: Skip trading jobs, run outcome measurements only
-  Continuous learning even when markets are closed
-
-Circuit Breaker Integration:
-===========================
-Before every trading cycle, checks if circuit breaker is tripped. If yes:
-- Skip all trading operations
-- Send alert notifications
-- Continue with data collection and analysis only
-
-Market Hours Awareness:
-======================
-All trading operations respect Alpaca calendar API for:
-- Market holidays (NYSE calendar)
-- Early market closes
-- Extended holiday weekends
-- Daylight saving time transitions
-
-Performance Monitoring:
-======================
-Every cycle logs comprehensive metrics:
-- Execution time per module
-- Number of tickers processed
-- Signals generated vs executed
-- Error rates and failure modes
-
-Error Recovery:
-==============
-The scheduler implements graceful degradation:
-- Individual module failures don't crash entire cycle
-- Failed cycles retry with exponential backoff
-- Critical errors trigger circuit breaker evaluation
-- All failures logged with full context for debugging
-
-Dependencies:
-============
-- APScheduler: Job scheduling and execution
-- Alpaca API: Market calendar and trading hours
-- All trading modules: discovery, engine, risk, executor
-- Database: Circuit breaker status and logging
+Orchestrates the full pipeline on a schedule:
+  - Primary job: every 30 minutes during market hours (9:30 AM - 4:00 PM ET)
+  - Pre-market job: once at 9:00 AM ET
+  - Post-market job: once at 4:30 PM ET
+  - Weekend: outcome measurement only
 """
 
 import os
+import sys
+import time
+import uuid
+import signal
 import logging
 import traceback
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
-from dotenv import load_dotenv
+from typing import Dict, Any, Optional, List
 
-# Scheduling and market hours
+from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
-import alpaca_trade_api as tradeapi
+from apscheduler.triggers.interval import IntervalTrigger
 
-# Load environment variables
 load_dotenv()
 
-# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+# Suppress noisy "Unclosed client session" errors from libsql's aiohttp usage
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 logger = logging.getLogger(__name__)
 
-# Global scheduler instance
 _scheduler: Optional[BlockingScheduler] = None
 
 
-def run_scheduler() -> None:
-    """Start the APScheduler event loop for continuous trading operations.
-
-    This is the main entry point for the autonomous trading system. It sets up
-    market-aware job schedules and runs indefinitely until manually stopped.
-
-    Job Schedule:
-    ------------
-    1. **Primary Trading Cycle**: Every 15 minutes during market hours
-       - Runs full pipeline: discovery → analysis → execution
-       - Only executes if market is open and circuit breaker not tripped
-
-    2. **Pre-market Preparation**: Daily at 9:00 AM ET
-       - Processes overnight news and performs sector rotation analysis
-       - Prepares for market open with fresh ticker discovery
-
-    3. **Post-market Analysis**: Daily at 4:30 PM ET
-       - Calculates daily P&L and portfolio performance
-       - Runs feedback loop for strategy weight updates
-       - Checks circuit breaker conditions
-
-    4. **Weekend Analysis**: Saturday at 10:00 AM ET
-       - Outcome measurement for trades closed during the week
-       - System health checks and performance analysis
-
-    Error Handling:
-    --------------
-    - Scheduler-level errors are caught and logged but don't crash the system
-    - Individual job failures are isolated and don't affect other jobs
-    - Failed jobs are retried up to 3 times with exponential backoff
-    - Critical failures trigger circuit breaker evaluation
-
-    Shutdown:
-    --------
-    - Graceful shutdown on SIGINT/SIGTERM
-    - Completes running jobs before shutdown
-    - Logs shutdown reason and system state
-
-    Environment Variables:
-    ---------------------
-    - ALPACA_API_KEY: Required for market hours checking
-    - ALPACA_SECRET_KEY: Required for market hours checking
-    - ALPACA_BASE_URL: Paper trading endpoint
-    - All other module-specific environment variables
-
-    Raises:
-    ------
-    SystemExit: On configuration errors or critical failures
-
-    Example Usage:
-    -------------
-    >>> from scheduler.loop import run_scheduler
-    >>> run_scheduler()  # Runs indefinitely until stopped
-    """
-    raise NotImplementedError("Not yet implemented")
-
-
-def run_trading_cycle(is_premarket: bool = False) -> Dict[str, Any]:
-    """Execute one complete trading cycle with all modules.
-
-    This is the core orchestration function that coordinates the entire trading
-    pipeline in the correct sequence. It handles all inter-module communication
-    and error recovery.
-
-    Execution Sequence:
-    ------------------
-    1. **Circuit Breaker Check**: Exit early if system is halted
-    2. **Discovery Phase**: Find active tickers for this cycle
-    3. **Data Collection**: Fetch market data and news for discovered tickers
-    4. **Analysis Phase**: Run sentiment analysis and technical strategies
-    5. **Signal Combination**: Weight and combine all signals using learned weights
-    6. **Risk Management**: Validate each signal against portfolio limits
-    7. **Execution Phase**: Place approved trades via Alpaca
-    8. **Logging Phase**: Record all trades and decisions for feedback loop
-
-    Pre-market vs Regular Cycles:
-    ----------------------------
-    - **Pre-market**: Includes sector rotation analysis and overnight news processing
-    - **Regular**: Standard discovery and analysis without sector rotation
-    - Both modes respect the same risk management and execution rules
-
-    Error Recovery:
-    --------------
-    - Module failures are caught and logged individually
-    - Partial failures allow other modules to continue
-    - Critical failures (discovery, risk management) abort the cycle
-    - All errors are aggregated in the return dictionary
-
-    Performance Tracking:
-    --------------------
-    - Measures execution time for each phase
-    - Tracks ticker count and signal generation rates
-    - Monitors resource usage and API call counts
-    - Logs all metrics for system optimization
-
-    Args:
-        is_premarket: Whether this is a pre-market cycle (enables sector rotation)
-                     Pre-market cycles run at 9:00 AM ET before market open
-                     Regular cycles run every 15 minutes during market hours
-
-    Returns:
-        Dict containing cycle results and performance metrics:
-        {
-            "success": bool,                    # Overall cycle success
-            "cycle_id": str,                   # Unique cycle identifier
-            "tickers_discovered": int,         # Number of tickers found
-            "signals_generated": int,          # Number of trading signals
-            "trades_executed": int,            # Number of actual trades placed
-            "execution_time_ms": int,          # Total cycle time
-            "phase_timings": Dict[str, int],   # Per-module execution times
-            "errors": List[str],               # Any errors encountered
-            "circuit_breaker_tripped": bool,   # Whether system was halted
-        }
-
-    Raises:
-    ------
-    Never raises - all errors are caught and returned in results dict
-
-    Example Usage:
-    -------------
-    >>> # Regular trading cycle
-    >>> result = run_trading_cycle(is_premarket=False)
-    >>> if result["success"]:
-    >>>     print(f"Executed {result['trades_executed']} trades")
-    >>>
-    >>> # Pre-market cycle with sector rotation
-    >>> result = run_trading_cycle(is_premarket=True)
-    >>> print(f"Discovered {result['tickers_discovered']} tickers")
-    """
-    raise NotImplementedError("Not yet implemented")
-
+# ═══════════════════════════════════════════════════════════════════════════
+# Market hours
+# ═══════════════════════════════════════════════════════════════════════════
 
 def is_market_open() -> bool:
-    """Check if the stock market is currently open using Alpaca calendar API.
-
-    This function provides authoritative market hours checking that accounts for:
-    - Regular trading hours (9:30 AM - 4:00 PM ET)
-    - Market holidays (NYSE calendar)
-    - Early market closes (holiday weekends)
-    - Daylight saving time transitions
-
-    Market Hours Logic:
-    ------------------
-    - Uses Alpaca's calendar API as the authoritative source
-    - Handles timezone conversion automatically
-    - Accounts for both regular and extended trading sessions
-    - Includes pre-market and after-hours status if needed
-
-    Error Handling:
-    --------------
-    - API failures default to False (conservative approach)
-    - Network timeouts are handled gracefully
-    - Invalid API responses logged and treated as market closed
-    - Fallback logic uses basic time-based checking if API unavailable
-
-    Performance:
-    -----------
-    - Results cached for 60 seconds to avoid excessive API calls
-    - Cache invalidation on timezone changes
-    - Efficient for high-frequency scheduler checks
-
-    Returns:
-        True if market is open for trading, False otherwise
-        Defaults to False on any API errors or uncertainties
-
-    Example Usage:
-    -------------
-    >>> if is_market_open():
-    >>>     print("Market is open - safe to place trades")
-    >>> else:
-    >>>     print("Market is closed - skip trading operations")
-
-    Integration:
-    -----------
-    Called by:
-    - run_trading_cycle() before any trade execution
-    - APScheduler job conditions for trading cycles
-    - Risk manager for final trade approval
-    - Dashboard for real-time status display
-    """
-    raise NotImplementedError("Not yet implemented")
+    """Check if market is open via Alpaca clock API. Defaults to False on error."""
+    try:
+        from executor.alpaca import is_market_open as alpaca_is_open
+        return alpaca_is_open()
+    except Exception as e:
+        logger.warning(f"Market hours check failed, assuming closed: {e}")
+        return False
 
 
-def is_circuit_breaker_tripped(db_path: str) -> bool:
-    """Check if the trading circuit breaker is currently tripped.
+# ═══════════════════════════════════════════════════════════════════════════
+# Circuit breaker
+# ═══════════════════════════════════════════════════════════════════════════
 
-    The circuit breaker is a critical safety mechanism that automatically halts
-    all trading when system performance falls below acceptable thresholds.
-    This prevents compounding losses during periods of poor strategy performance.
+def is_circuit_breaker_tripped(db_path: str = "") -> bool:
+    """Check circuit breaker status. Defaults to True (halt) on error."""
+    try:
+        from db.client import is_circuit_breaker_tripped as db_cb_check
+        return db_cb_check()
+    except Exception as e:
+        logger.error(f"Circuit breaker check failed, defaulting to HALT: {e}")
+        return True
 
-    Circuit Breaker Conditions:
-    ---------------------------
-    - Rolling 7-day win rate falls below 40%
-    - Consecutive daily losses exceed 5% of portfolio value
-    - System error rate exceeds 10% over 24 hours
-    - Manual halt triggered via dashboard or emergency procedure
 
-    Database Integration:
-    --------------------
-    - Checks `circuit_breaker` table in Turso database
-    - Reads current status and halt reason
-    - Logs all circuit breaker status checks for audit trail
+# ═══════════════════════════════════════════════════════════════════════════
+# Primary trading cycle
+# ═══════════════════════════════════════════════════════════════════════════
 
-    Safety Philosophy:
-    -----------------
-    - Defaults to halted state on database errors (fail-safe)
-    - Conservative approach protects capital during system issues
-    - Manual reset required to resume trading after halt
-    - All halt decisions logged with full context
+def run_trading_cycle(is_premarket: bool = False) -> Dict[str, Any]:
+    """Execute one complete trading cycle.
 
-    Performance Impact:
-    ------------------
-    - Called before every trading cycle (every 15 minutes)
-    - Database query cached for 60 seconds for efficiency
-    - Minimal latency impact on trading decisions
-    - Critical path for trade execution safety
+    Sequence:
+      1. Circuit breaker check
+      2. Market hours check (skip execution if closed, unless premarket)
+      3. Discovery — find active tickers
+      4. Fetch news via aggregator
+      5. Sentiment analysis (batch)
+      6. Fetch market data for discovered tickers
+      7. Per-ticker: strategies -> combiner -> risk check -> execute
+      8. Log all trades
 
     Args:
-        db_path: Path to Turso database connection string
-                Can be local SQLite path for testing/development
+        is_premarket: True for the 9:00 AM pre-market run (sector rotation on).
 
     Returns:
-        True if circuit breaker is tripped (halt trading)
-        False if system is operational (allow trading)
-        Defaults to True on any database errors (fail-safe)
-
-    Example Usage:
-    -------------
-    >>> if is_circuit_breaker_tripped("trader.db"):
-    >>>     logger.warning("Circuit breaker tripped - halting all trading")
-    >>>     return
-    >>> else:
-    >>>     logger.info("Circuit breaker clear - proceeding with trading")
-
-    Database Schema:
-    ---------------
-    Queries the circuit_breaker table:
-    ```sql
-    SELECT tripped, reason, win_rate_at_trip
-    FROM circuit_breaker
-    WHERE id = 1
-    ```
-
-    Integration Points:
-    ------------------
-    - Called by scheduler before every trading cycle
-    - Checked by risk manager before trade approval
-    - Monitored by dashboard for real-time status
-    - Updated by feedback/weights.py when conditions change
+        Cycle result dict with stats and errors.
     """
-    raise NotImplementedError("Not yet implemented")
+    cycle_id = str(uuid.uuid4())[:8]
+    cycle_start = time.monotonic()
+    phase_timings: Dict[str, int] = {}
+    errors: List[str] = []
+
+    result = {
+        "success": False,
+        "cycle_id": cycle_id,
+        "tickers_discovered": 0,
+        "signals_generated": 0,
+        "trades_executed": 0,
+        "execution_time_ms": 0,
+        "phase_timings": phase_timings,
+        "errors": errors,
+        "circuit_breaker_tripped": False,
+    }
+
+    logger.info(f"{'='*60}")
+    logger.info(f"Cycle {cycle_id} starting ({'pre-market' if is_premarket else 'regular'})")
+    logger.info(f"{'='*60}")
+
+    # ── 1. Circuit breaker ─────────────────────────────────────────────
+    if is_circuit_breaker_tripped():
+        logger.warning(f"Cycle {cycle_id}: Circuit breaker is TRIPPED — skipping trading")
+        result["circuit_breaker_tripped"] = True
+        # Still run outcome measurement
+        _run_outcome_measurement(cycle_id, errors)
+        result["execution_time_ms"] = int((time.monotonic() - cycle_start) * 1000)
+        return result
+
+    # ── 2. Market hours (allow premarket to proceed regardless) ────────
+    market_open = is_market_open()
+    if not market_open and not is_premarket:
+        logger.info(f"Cycle {cycle_id}: Market is closed — skipping trading cycle")
+        result["execution_time_ms"] = int((time.monotonic() - cycle_start) * 1000)
+        result["success"] = True
+        return result
+
+    # ── 3. Discovery ───────────────────────────────────────────────────
+    t0 = time.monotonic()
+    try:
+        from fetchers.discovery import discover_tickers
+        discovery = discover_tickers(is_premarket=is_premarket)
+        tickers = discovery.get("tickers", [])
+        sources = discovery.get("sources", {})
+        mode = discovery.get("mode", "unknown")
+        result["tickers_discovered"] = len(tickers)
+        logger.info(f"Cycle {cycle_id}: Discovered {len(tickers)} tickers (mode={mode})")
+    except Exception as e:
+        msg = f"Discovery failed: {e}"
+        logger.error(f"Cycle {cycle_id}: {msg}\n{traceback.format_exc()}")
+        errors.append(msg)
+        result["execution_time_ms"] = int((time.monotonic() - cycle_start) * 1000)
+        return result  # Can't continue without tickers
+    phase_timings["discovery"] = int((time.monotonic() - t0) * 1000)
+
+    if not tickers:
+        logger.info(f"Cycle {cycle_id}: No tickers discovered — nothing to do")
+        result["success"] = True
+        result["execution_time_ms"] = int((time.monotonic() - cycle_start) * 1000)
+        return result
+
+    # ── 4. Fetch news ──────────────────────────────────────────────────
+    t0 = time.monotonic()
+    articles = []
+    try:
+        from fetchers.aggregator import fetch_all_news
+        articles = fetch_all_news(
+            discovery_context=discovery,
+            watchlist=tickers,
+        )
+        logger.info(f"Cycle {cycle_id}: Fetched {len(articles)} articles")
+    except Exception as e:
+        msg = f"News fetch failed: {e}"
+        logger.error(f"Cycle {cycle_id}: {msg}\n{traceback.format_exc()}")
+        errors.append(msg)
+        # Continue — we can still run technical strategies without news
+    phase_timings["news_fetch"] = int((time.monotonic() - t0) * 1000)
+
+    # ── 5. Sentiment analysis ──────────────────────────────────────────
+    t0 = time.monotonic()
+    sentiment_results = []
+    ticker_sentiments: Dict[str, Dict] = {}
+    try:
+        from engine.sentiment import batch_analyze_articles, batch_record_sentiments
+        if articles:
+            sentiment_results = batch_analyze_articles(articles)
+            ticker_sentiments = batch_record_sentiments(tickers, sentiment_results)
+            logger.info(
+                f"Cycle {cycle_id}: Sentiment analysis produced "
+                f"{len(sentiment_results)} results for {len(ticker_sentiments)} tickers"
+            )
+    except Exception as e:
+        msg = f"Sentiment analysis failed: {e}"
+        logger.error(f"Cycle {cycle_id}: {msg}\n{traceback.format_exc()}")
+        errors.append(msg)
+    phase_timings["sentiment"] = int((time.monotonic() - t0) * 1000)
+
+    # ── 6. Market data ─────────────────────────────────────────────────
+    t0 = time.monotonic()
+    market_data: Dict[str, Any] = {"tickers": {}, "macro": {}}
+    try:
+        from fetchers.market import fetch_market_data
+        market_data = fetch_market_data(
+            tickers,
+            include_sector_etfs=is_premarket,
+        )
+        logger.info(
+            f"Cycle {cycle_id}: Market data for {len(market_data.get('tickers', {}))} tickers"
+        )
+    except Exception as e:
+        msg = f"Market data fetch failed: {e}"
+        logger.error(f"Cycle {cycle_id}: {msg}\n{traceback.format_exc()}")
+        errors.append(msg)
+    phase_timings["market_data"] = int((time.monotonic() - t0) * 1000)
+
+    # ── 7. Regime classification ───────────────────────────────────────
+    t0 = time.monotonic()
+    regime_data = {"regime": "neutral", "confidence": 0.0}
+    try:
+        from engine.regime import get_current_regime
+        macro_news_score = _aggregate_macro_sentiment(ticker_sentiments)
+        regime_data = get_current_regime(
+            market_data.get("macro", {}),
+            macro_news_score=macro_news_score,
+        )
+        logger.info(f"Cycle {cycle_id}: Regime = {regime_data.get('regime')} "
+                     f"(confidence={regime_data.get('confidence', 0):.2f})")
+    except Exception as e:
+        msg = f"Regime classification failed: {e}"
+        logger.error(f"Cycle {cycle_id}: {msg}")
+        errors.append(msg)
+    phase_timings["regime"] = int((time.monotonic() - t0) * 1000)
+
+    # ── 8. Load learned weights ────────────────────────────────────────
+    learned_weights: Dict[str, float] = {}
+    try:
+        from engine.combiner import load_learned_weights
+        learned_weights = load_learned_weights()
+    except Exception as e:
+        logger.warning(f"Could not load learned weights: {e}")
+
+    # ── 9. Per-ticker signal pipeline ──────────────────────────────────
+    t0 = time.monotonic()
+    signals_generated = 0
+    trades_executed = 0
+    portfolio = None
+
+    # Pre-fetch portfolio once
+    try:
+        from executor.alpaca import get_portfolio
+        portfolio = get_portfolio()
+    except Exception as e:
+        msg = f"Portfolio fetch failed: {e}"
+        logger.error(f"Cycle {cycle_id}: {msg}")
+        errors.append(msg)
+        result["execution_time_ms"] = int((time.monotonic() - cycle_start) * 1000)
+        return result  # Can't do risk checks without portfolio state
+
+    for ticker in tickers:
+        try:
+            ticker_market = market_data.get("tickers", {}).get(ticker, {})
+            ticker_sentiment = ticker_sentiments.get(ticker)
+
+            # Skip tickers with no market data
+            if not ticker_market or not ticker_market.get("price"):
+                logger.debug(f"Cycle {cycle_id}: Skipping {ticker} — no market data")
+                continue
+
+            # Run strategies
+            from engine.strategies import run_all_strategies
+            raw_output = run_all_strategies(
+                ticker=ticker,
+                market_data=ticker_market,
+                sentiment_data=ticker_sentiment,
+                macro_data=market_data.get("macro"),
+            )
+
+            raw_signals = raw_output.get("signals", [])
+            if not raw_signals:
+                continue
+
+            # Combine signals
+            from engine.combiner import combine_ticker_signals
+            combined = combine_ticker_signals(
+                ticker=ticker,
+                raw_output=raw_output,
+                regime_data=regime_data,
+                learned_weights=learned_weights,
+            )
+
+            if combined.get("signal") == "HOLD":
+                continue
+
+            signals_generated += 1
+            logger.info(
+                f"Cycle {cycle_id}: Signal for {ticker}: "
+                f"{combined['signal']} (confidence={combined.get('confidence', 0):.3f})"
+            )
+
+            # Don't execute trades if market is closed (premarket = analysis only)
+            if not market_open:
+                logger.info(f"Cycle {cycle_id}: Market closed — signal logged but not executed for {ticker}")
+                continue
+
+            # Risk check
+            from risk.manager import check_trade
+            risk_result = check_trade(
+                signal=combined,
+                portfolio=portfolio,
+                market_data=ticker_market,
+            )
+
+            if not risk_result.get("approved"):
+                logger.info(
+                    f"Cycle {cycle_id}: Risk rejected {ticker}: {risk_result.get('reason')}"
+                )
+                continue
+
+            # Execute trade
+            from executor.alpaca import place_order
+            order_result = place_order(
+                ticker=ticker,
+                qty=risk_result["shares"],
+                side=combined["signal"].lower(),
+            )
+
+            if "error" in order_result:
+                msg = f"Order failed for {ticker}: {order_result['error']}"
+                logger.error(f"Cycle {cycle_id}: {msg}")
+                errors.append(msg)
+                continue
+
+            trades_executed += 1
+            logger.info(
+                f"Cycle {cycle_id}: Executed {combined['signal']} "
+                f"{risk_result['shares']} {ticker} — order_id={order_result.get('order_id')}"
+            )
+
+            # Log trade
+            try:
+                from feedback.logger import log_trade
+                log_trade({
+                    "ticker": ticker,
+                    "signal": combined["signal"],
+                    "confidence": combined.get("confidence", 0),
+                    "sentiment_score": (ticker_sentiment or {}).get("sentiment_score"),
+                    "sentiment_source": _primary_sentiment_source(ticker_sentiment),
+                    "strategies_fired": list(combined.get("components", {}).keys()),
+                    "discovery_sources": sources.get(ticker, []),
+                    "regime_mode": regime_data.get("regime"),
+                    "article_urls": [],
+                    "entry_price": risk_result["entry_price"],
+                    "shares": risk_result["shares"],
+                    "stop_loss_price": risk_result["stop_loss"],
+                    "take_profit_price": risk_result["take_profit"],
+                    "order_id": order_result.get("order_id"),
+                })
+            except Exception as e:
+                logger.error(f"Cycle {cycle_id}: Trade logging failed for {ticker}: {e}")
+
+            # Refresh portfolio after each trade so risk checks stay accurate
+            try:
+                portfolio = get_portfolio()
+            except Exception:
+                pass
+
+        except Exception as e:
+            msg = f"Pipeline failed for {ticker}: {e}"
+            logger.error(f"Cycle {cycle_id}: {msg}\n{traceback.format_exc()}")
+            errors.append(msg)
+
+    phase_timings["signal_pipeline"] = int((time.monotonic() - t0) * 1000)
+    result["signals_generated"] = signals_generated
+    result["trades_executed"] = trades_executed
+
+    # ── 10. Done ───────────────────────────────────────────────────────
+    elapsed_ms = int((time.monotonic() - cycle_start) * 1000)
+    result["execution_time_ms"] = elapsed_ms
+    result["success"] = True
+
+    logger.info(
+        f"Cycle {cycle_id} complete: "
+        f"{len(tickers)} tickers, {signals_generated} signals, "
+        f"{trades_executed} trades, {len(errors)} errors, {elapsed_ms}ms"
+    )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Post-market job
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_post_market() -> None:
+    """Post-market job: measure outcomes + feedback loop."""
+    logger.info("Running post-market analysis")
+    errors: List[str] = []
+
+    _run_outcome_measurement("post_market", errors)
+
+    if errors:
+        logger.warning(f"Post-market completed with errors: {errors}")
+    else:
+        logger.info("Post-market analysis complete")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Outcome measurement (reusable)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _run_outcome_measurement(context: str, errors: List[str]) -> None:
+    """Run outcome measurement and weight updates."""
+    try:
+        from feedback.outcomes import measure_outcomes
+        outcomes = measure_outcomes()
+        logger.info(f"[{context}] Measured {len(outcomes)} outcomes")
+    except Exception as e:
+        msg = f"Outcome measurement failed: {e}"
+        logger.error(f"[{context}] {msg}\n{traceback.format_exc()}")
+        errors.append(msg)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _aggregate_macro_sentiment(ticker_sentiments: Dict[str, Dict]) -> float:
+    """Average all ticker sentiments as a rough macro sentiment proxy."""
+    scores = [
+        s.get("sentiment_score", 0)
+        for s in ticker_sentiments.values()
+        if s.get("article_count", 0) > 0
+    ]
+    if not scores:
+        return 0.0
+    return sum(scores) / len(scores)
+
+
+def _primary_sentiment_source(sentiment_data: Optional[Dict]) -> Optional[str]:
+    """Pick the dominant sentiment source from source_breakdown."""
+    if not sentiment_data:
+        return None
+    breakdown = sentiment_data.get("source_breakdown", {})
+    if not breakdown:
+        return None
+    return max(breakdown, key=breakdown.get)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Scheduler setup
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_scheduler() -> None:
+    """Start the APScheduler event loop.
+
+    Jobs:
+      - Primary: every 30 min during market hours (9:30-16:00 ET, Mon-Fri)
+      - Pre-market: 9:00 AM ET, Mon-Fri
+      - Post-market: 4:30 PM ET, Mon-Fri
+      - Weekend outcome check: Saturday 10:00 AM ET
+    """
+    global _scheduler
+
+    logger.info("="*60)
+    logger.info("AI Paper Trader - Starting Scheduler")
+    logger.info("="*60)
+
+    # Validate required env vars
+    required = ["ALPACA_API_KEY", "ALPACA_SECRET_KEY", "TURSO_CONNECTION_URL", "TURSO_AUTH_TOKEN"]
+    missing = [k for k in required if not os.getenv(k)]
+    if missing:
+        logger.error(f"Missing required environment variables: {missing}")
+        sys.exit(1)
+
+    # Initialize DB weights if needed
+    try:
+        from db.client import initialize_default_weights
+        initialize_default_weights()
+    except Exception as e:
+        logger.warning(f"Could not initialize default weights: {e}")
+
+    _scheduler = BlockingScheduler(timezone="US/Eastern")
+
+    # Primary trading cycle — every 30 minutes during market hours
+    _scheduler.add_job(
+        func=_safe_run_trading_cycle,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour="9-15",
+            minute="0,30",
+            timezone="US/Eastern",
+        ),
+        id="primary_cycle",
+        name="Primary Trading Cycle (30min)",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
+    # Pre-market — 9:00 AM ET weekdays
+    _scheduler.add_job(
+        func=_safe_run_premarket,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour=9,
+            minute=0,
+            timezone="US/Eastern",
+        ),
+        id="premarket",
+        name="Pre-Market Analysis",
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+
+    # Post-market — 4:30 PM ET weekdays
+    _scheduler.add_job(
+        func=run_post_market,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour=16,
+            minute=30,
+            timezone="US/Eastern",
+        ),
+        id="postmarket",
+        name="Post-Market Analysis",
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+
+    # Weekend outcome measurement — Saturday 10:00 AM ET
+    _scheduler.add_job(
+        func=_safe_run_weekend,
+        trigger=CronTrigger(
+            day_of_week="sat",
+            hour=10,
+            minute=0,
+            timezone="US/Eastern",
+        ),
+        id="weekend_outcomes",
+        name="Weekend Outcome Measurement",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    # Graceful shutdown
+    def _shutdown(signum, frame):
+        logger.info(f"Received signal {signum} — shutting down scheduler")
+        if _scheduler and _scheduler.running:
+            _scheduler.shutdown(wait=False)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    # Log schedule (next_run_time is only available after scheduler starts,
+    # so we just log job names here)
+    logger.info("Scheduled jobs:")
+    for job in _scheduler.get_jobs():
+        logger.info(f"  - {job.name} (id={job.id})")
+
+    logger.info("Scheduler running. Press Ctrl+C to stop.")
+
+    try:
+        _scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Scheduler stopped")
+
+
+# ── Safe wrappers (prevent scheduler crash on unhandled exceptions) ─────
+
+def _safe_run_trading_cycle():
+    """Wrapper for regular trading cycle with error isolation."""
+    try:
+        run_trading_cycle(is_premarket=False)
+    except Exception as e:
+        logger.error(f"Unhandled error in trading cycle: {e}\n{traceback.format_exc()}")
+
+
+def _safe_run_premarket():
+    """Wrapper for pre-market cycle."""
+    try:
+        run_trading_cycle(is_premarket=True)
+    except Exception as e:
+        logger.error(f"Unhandled error in pre-market cycle: {e}\n{traceback.format_exc()}")
+
+
+def _safe_run_weekend():
+    """Wrapper for weekend outcome measurement."""
+    try:
+        errors: List[str] = []
+        _run_outcome_measurement("weekend", errors)
+    except Exception as e:
+        logger.error(f"Unhandled error in weekend job: {e}\n{traceback.format_exc()}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    run_scheduler()
