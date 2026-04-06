@@ -4,6 +4,7 @@ import os
 import json
 import anthropic
 import logging
+from datetime import datetime, timezone
 from typing import List, Dict
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,8 @@ def analyze_article_sentiment(article: Dict) -> List[Dict]:
     results = []
     source = article.get('source', '')
 
+    published_at = article.get('published_at')
+
     if source == 'marketaux':
         # Marketaux provides ticker and sentiment_score directly
         ticker = article.get('ticker')
@@ -50,6 +53,7 @@ def analyze_article_sentiment(article: Dict) -> List[Dict]:
                 'sentiment_score': float(sentiment_score),
                 'source': 'marketaux',
                 'reasoning': f"Pre-computed sentiment from Marketaux: {sentiment_score}",
+                'published_at': published_at,
                 **_DEFAULT_ENRICHMENT,
             })
 
@@ -65,6 +69,7 @@ def analyze_article_sentiment(article: Dict) -> List[Dict]:
                     'sentiment_score': float(sentiment_score),
                     'source': 'massive',
                     'reasoning': f"Pre-computed sentiment from Massive: {sentiment_score}",
+                    'published_at': published_at,
                     **_DEFAULT_ENRICHMENT,
                 })
 
@@ -98,6 +103,7 @@ def analyze_article_sentiment(article: Dict) -> List[Dict]:
                         'urgency': claude_result.get('urgency', 'standard'),
                         'materiality': claude_result.get('materiality', 'unknown'),
                         'time_horizon': claude_result.get('time_horizon', 'medium_term'),
+                        'published_at': published_at,
                     })
             except Exception as e:
                 logger.error(f"Claude sentiment analysis failed for {ticker} in {source} article: {e}")
@@ -206,6 +212,96 @@ _VALID_URGENCY = {'breaking', 'developing', 'standard'}
 _VALID_MATERIALITY = {'high', 'medium', 'low'}
 _VALID_TIME_HORIZON = {'intraday', 'short_term', 'medium_term', 'long_term'}
 
+# --- Aggregation weights ---
+
+# Source credibility: Claude-analyzed full text > pre-computed ticker-specific > pre-computed bulk
+_SOURCE_CREDIBILITY = {
+    'newsapi': 1.0,    # Claude-analyzed full article text
+    'alpaca': 1.0,
+    'polygon': 1.0,
+    'marketaux': 0.8,  # Pre-computed, ticker-specific, generally reliable
+    'massive': 0.6,    # Pre-computed, broader coverage but noisier
+}
+
+# Materiality impact on weight — high-materiality news should dominate
+_MATERIALITY_WEIGHT = {
+    'high': 2.0,       # Earnings, guidance, FDA, major contract
+    'medium': 1.0,     # Product launch, management change, partnership
+    'low': 0.5,        # Conference attendance, generic commentary
+    'unknown': 0.5,    # Pre-computed sources without materiality classification
+}
+
+# Urgency impact — breaking news is more actionable
+_URGENCY_WEIGHT = {
+    'breaking': 2.0,   # Just happened, market reacting now
+    'developing': 1.3, # Unfolding, still evolving
+    'standard': 1.0,   # Background/thematic
+}
+
+# Recency decay brackets (hours_old -> multiplier)
+# Articles from the last hour count 3x more than 6+ hour old articles
+_RECENCY_BRACKETS = [
+    (1.0, 3.0),    # 0-1 hours old: 3x weight
+    (3.0, 2.0),    # 1-3 hours old: 2x weight
+    (6.0, 1.0),    # 3-6 hours old: 1x weight (baseline)
+    (float('inf'), 0.5),  # 6+ hours old: 0.5x weight
+]
+
+
+def _compute_article_weight(result: Dict, now: datetime = None) -> float:
+    """Compute aggregation weight for a single sentiment result.
+
+    Weight = source_credibility * materiality * urgency * recency.
+
+    Args:
+        result: Single sentiment result dict with source, materiality,
+                urgency, and published_at fields.
+        now: Current time (UTC). Defaults to datetime.now(timezone.utc).
+
+    Returns:
+        Float weight >= 0.1 (floor prevents any article from being fully ignored).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    source = result.get('source', 'unknown')
+    source_w = _SOURCE_CREDIBILITY.get(source, 0.5)
+
+    materiality = result.get('materiality', 'unknown')
+    materiality_w = _MATERIALITY_WEIGHT.get(materiality, 0.5)
+
+    urgency = result.get('urgency', 'standard')
+    urgency_w = _URGENCY_WEIGHT.get(urgency, 1.0)
+
+    # Recency decay
+    recency_w = 1.0
+    published_at = result.get('published_at')
+    if published_at:
+        try:
+            if isinstance(published_at, str):
+                # Handle ISO format with or without Z suffix
+                pub_str = published_at.replace('Z', '+00:00')
+                pub_time = datetime.fromisoformat(pub_str)
+            elif isinstance(published_at, datetime):
+                pub_time = published_at
+            else:
+                pub_time = None
+
+            if pub_time is not None:
+                # Ensure timezone-aware comparison
+                if pub_time.tzinfo is None:
+                    pub_time = pub_time.replace(tzinfo=timezone.utc)
+                hours_old = max(0.0, (now - pub_time).total_seconds() / 3600.0)
+                for bracket_hours, bracket_weight in _RECENCY_BRACKETS:
+                    if hours_old <= bracket_hours:
+                        recency_w = bracket_weight
+                        break
+        except (ValueError, TypeError):
+            recency_w = 1.0  # Can't parse date, use baseline
+
+    weight = source_w * materiality_w * urgency_w * recency_w
+    return max(0.1, weight)
+
 
 def _parse_claude_result(result: Dict) -> Dict:
     """Parse and validate a successful JSON response from Claude."""
@@ -288,7 +384,14 @@ def batch_analyze_articles(articles: List[Dict]) -> List[Dict]:
 
 
 def get_ticker_sentiment_scores(ticker: str, sentiment_results: List[Dict]) -> Dict:
-    """Get aggregated sentiment scores for a specific ticker.
+    """Get weighted-aggregated sentiment scores for a specific ticker.
+
+    Each article's sentiment is weighted by:
+      source credibility * materiality * urgency * recency decay
+
+    A breaking earnings-miss from Reuters (high materiality, breaking urgency,
+    published 10 minutes ago) will massively outweigh a generic industry-trend
+    blog post (low materiality, standard urgency, 5 hours old).
 
     Args:
         ticker: Stock ticker symbol.
@@ -311,9 +414,13 @@ def get_ticker_sentiment_scores(ticker: str, sentiment_results: List[Dict]) -> D
             'confidence': 0.0,
         }
 
-    # Calculate weighted average sentiment
-    scores = [result['sentiment_score'] for result in ticker_sentiments]
-    avg_sentiment = sum(scores) / len(scores)
+    # Compute per-article weights and weighted sentiment
+    now = datetime.now(timezone.utc)
+    weights = [_compute_article_weight(r, now) for r in ticker_sentiments]
+    scores = [r['sentiment_score'] for r in ticker_sentiments]
+
+    total_weight = sum(weights)
+    weighted_sentiment = sum(s * w for s, w in zip(scores, weights)) / total_weight
 
     # Count articles by source
     source_breakdown = {}
@@ -321,10 +428,12 @@ def get_ticker_sentiment_scores(ticker: str, sentiment_results: List[Dict]) -> D
         source = result.get('source', 'unknown')
         source_breakdown[source] = source_breakdown.get(source, 0) + 1
 
-    # Confidence based on number of articles and source diversity
+    # Confidence: article count + source diversity + weight concentration
+    # High total weight means high-quality, recent, material articles
     article_count = len(ticker_sentiments)
     source_count = len(source_breakdown)
-    confidence = min(1.0, (article_count * 0.2) + (source_count * 0.1))
+    avg_weight = total_weight / article_count
+    confidence = min(1.0, (article_count * 0.15) + (source_count * 0.1) + (avg_weight * 0.1))
 
     # Aggregate enriched metadata
     has_breaking = any(r.get('urgency') == 'breaking' for r in ticker_sentiments)
@@ -353,12 +462,109 @@ def get_ticker_sentiment_scores(ticker: str, sentiment_results: List[Dict]) -> D
 
     return {
         'ticker': ticker,
-        'sentiment_score': round(avg_sentiment, 3),
+        'sentiment_score': round(weighted_sentiment, 3),
         'article_count': article_count,
         'source_breakdown': source_breakdown,
         'confidence': round(confidence, 2),
         'individual_scores': scores,
+        'individual_weights': [round(w, 3) for w in weights],
         'urgency': dominant_urgency,
         'materiality': max_materiality,
         'time_horizon': shortest_horizon,
     }
+
+
+# ============================================================================
+# SENTIMENT HISTORY TRACKING
+# ============================================================================
+
+
+def record_ticker_sentiment(ticker: str, sentiment_results: List[Dict]) -> Dict:
+    """Aggregate sentiment for a ticker, record to DB, and compute cycle-over-cycle delta.
+
+    This is the function the scheduler loop should call instead of
+    get_ticker_sentiment_scores directly. It:
+      1. Aggregates via get_ticker_sentiment_scores (pure, no DB)
+      2. Fetches previous cycle's score from sentiment_history
+      3. Computes delta (current - previous)
+      4. Saves current score to sentiment_history
+      5. Returns enriched dict with delta fields
+
+    Args:
+        ticker: Stock ticker symbol.
+        sentiment_results: List of sentiment results from batch_analyze_articles.
+
+    Returns:
+        Dict from get_ticker_sentiment_scores, plus:
+            sentiment_delta (float or None): change from previous cycle
+            previous_score (float or None): previous cycle's score
+            previous_recorded_at (str or None): when previous was recorded
+            delta_direction (str): 'bullish_shift', 'bearish_shift', or 'stable'
+    """
+    from db.client import save_sentiment_score, get_previous_sentiment
+
+    aggregated = get_ticker_sentiment_scores(ticker, sentiment_results)
+    current_score = aggregated['sentiment_score']
+    article_count = aggregated['article_count']
+
+    # Fetch previous cycle's sentiment
+    previous = get_previous_sentiment(ticker)
+
+    if previous is not None:
+        prev_score = previous['sentiment_score']
+        delta = round(current_score - prev_score, 3)
+
+        if delta > 0.1:
+            direction = 'bullish_shift'
+        elif delta < -0.1:
+            direction = 'bearish_shift'
+        else:
+            direction = 'stable'
+
+        aggregated['sentiment_delta'] = delta
+        aggregated['previous_score'] = prev_score
+        aggregated['previous_recorded_at'] = previous['recorded_at']
+        aggregated['delta_direction'] = direction
+    else:
+        aggregated['sentiment_delta'] = None
+        aggregated['previous_score'] = None
+        aggregated['previous_recorded_at'] = None
+        aggregated['delta_direction'] = 'stable'
+
+    # Record current cycle (even if article_count is 0 — absence of news is signal)
+    try:
+        save_sentiment_score(ticker, current_score, article_count)
+    except Exception as e:
+        logger.error(f"Failed to save sentiment history for {ticker}: {e}")
+
+    return aggregated
+
+
+def batch_record_sentiments(tickers: List[str], sentiment_results: List[Dict]) -> Dict[str, Dict]:
+    """Record sentiment history and compute deltas for all tickers in a cycle.
+
+    Convenience wrapper for the scheduler loop. Calls record_ticker_sentiment
+    for each ticker.
+
+    Args:
+        tickers: List of active ticker symbols for this cycle.
+        sentiment_results: All sentiment results from batch_analyze_articles.
+
+    Returns:
+        Dict mapping ticker -> enriched sentiment dict (with delta fields).
+    """
+    ticker_sentiments = {}
+
+    for ticker in tickers:
+        try:
+            ticker_sentiments[ticker] = record_ticker_sentiment(ticker, sentiment_results)
+        except Exception as e:
+            logger.error(f"Failed to record sentiment for {ticker}: {e}")
+            # Fall back to pure aggregation without DB
+            ticker_sentiments[ticker] = get_ticker_sentiment_scores(ticker, sentiment_results)
+
+    shifts = [t for t, s in ticker_sentiments.items() if s.get('delta_direction') != 'stable']
+    if shifts:
+        logger.info(f"Sentiment shifts detected: {', '.join(shifts)}")
+
+    return ticker_sentiments

@@ -1,281 +1,210 @@
-"""Trade outcome measurement for autonomous paper trading system.
+"""Trade outcome measurement for the feedback loop.
 
-This module measures the performance of executed trades and classifies outcomes
-for the feedback loop. It runs as a scheduled job to check open trades and
-determine when to close positions based on time and performance thresholds.
-
-CRITICAL ARCHITECTURE NOTE:
-===========================
-This is a SCHEDULED COMPONENT that runs independently of the main trading cycle.
-It monitors all open trades continuously and measures outcomes for the learning
-system. Outcomes feed directly into weight adjustment via feedback/weights.py.
-
-Outcome Measurement Philosophy:
-==============================
-The system learns by measuring trade outcomes across multiple timeframes:
-- **Holding Period**: Default 8 hours, configurable per strategy
-- **Time-based Exits**: Automatic closure after holding period
-- **Target-based Exits**: Stop loss and take profit triggers
-- **Performance Classification**: WIN/LOSS/NEUTRAL based on returns
-
-Outcome measurement is conservative and focuses on:
-- **Risk-adjusted returns**: Not just absolute gains
-- **Consistent performance**: Avoiding large losses
-- **Time efficiency**: Faster positive outcomes preferred
-
-Classification Thresholds:
-=========================
-Trade outcomes are classified as:
-- **WIN**: Return > +1% (meaningful positive outcome)
-- **LOSS**: Return < -1% (meaningful negative outcome)
-- **NEUTRAL**: Return between -1% and +1% (no clear signal)
-
-These thresholds focus learning on trades with clear directional outcomes
-and avoid noise from small fluctuations around break-even.
-
-Measurement Schedule:
-====================
-The outcome measurement runs on multiple schedules:
-- **Every 4 hours**: Check for time-based exits and early outcomes
-- **Market close**: Daily measurement and exit logic
-- **Weekend**: Comprehensive analysis of all closed positions
-
-This ensures timely outcome measurement without excessive polling.
-
-Database Integration:
-====================
-Reads from `trades` table to find pending trades
-Writes to `outcomes` table with measured results:
-```sql
-INSERT INTO outcomes (
-    trade_id, exit_price, return_pct, outcome,
-    holding_period_hours, measured_at
-) VALUES (...)
-```
-
-Position Management:
-===================
-The outcome measurement system also handles:
-- **Automatic exits**: Time-based and target-based closures
-- **Stop loss triggers**: Immediate exits on loss thresholds
-- **Take profit triggers**: Automatic profit taking
-- **Position tracking**: Integration with Alpaca for current prices
-
-Integration with Learning:
-=========================
-Measured outcomes feed into:
-- feedback/weights.py: Strategy and source weight updates
-- dashboard/app.py: Performance visualization and reporting
-- Analysis systems: Historical performance evaluation
-- Circuit breaker: System halt evaluation based on outcomes
+Scheduled job that checks open trades, fetches current prices, classifies
+outcomes (WIN/LOSS/NEUTRAL), and records them for weight adjustment.
+Runs every 4 hours and at market close.
 """
 
 import logging
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone, timedelta
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
 # Outcome classification thresholds
-WIN_THRESHOLD = 0.01      # +1% return = WIN
-LOSS_THRESHOLD = -0.01    # -1% return = LOSS
-# Between thresholds = NEUTRAL
+WIN_THRESHOLD = 0.01      # +1% return
+LOSS_THRESHOLD = -0.01    # -1% return
 
-# Default holding periods (hours)
-DEFAULT_HOLDING_PERIOD = 8    # 8 hours default
-MAX_HOLDING_PERIOD = 72       # 3 days maximum
-MIN_HOLDING_PERIOD = 1        # 1 hour minimum
+# Holding period
+DEFAULT_HOLDING_PERIOD = 8    # hours
+MAX_HOLDING_PERIOD = 72       # 3 days
 
 
-def measure_outcomes(db_path: str) -> List[Dict[str, Any]]:
-    """Measure outcomes for all pending trades and classify performance.
+def measure_outcomes() -> List[Dict[str, Any]]:
+    """Measure outcomes for all pending (unmeasured) trades.
 
-    This is the main entry point for outcome measurement. It finds all open
-    trades, checks their current performance, and determines if they should
-    be closed based on time or performance criteria.
+    Process:
+      1. Query trades that have no row in outcomes yet.
+      2. For each, fetch current price via yfinance.
+      3. If holding period exceeded OR stop/TP hit → classify and record.
+      4. Trigger weight update for each recorded outcome.
 
-    Measurement Process:
-    -------------------
-    1. **Find Pending Trades**: Query database for open positions
-    2. **Get Current Prices**: Fetch live prices from market data
-    3. **Calculate Returns**: Compute performance since entry
-    4. **Apply Exit Logic**: Check time and target-based exit criteria
-    5. **Classify Outcomes**: WIN/LOSS/NEUTRAL based on returns
-    6. **Update Database**: Record outcomes and close positions
-    7. **Trigger Actions**: Alert weight update system
+    Returns list of measured outcome dicts.
+    """
+    pending = _get_pending_trades()
+    if not pending:
+        logger.info("No pending trades to measure")
+        return []
 
-    Exit Criteria:
-    -------------
-    **Time-based Exits:**
-    - Default: Close after 8 hours
-    - Strategy-specific: Different holding periods per strategy
-    - Weekend: Close all positions before market close Friday
+    results = []
+    for trade in pending:
+        try:
+            outcome = _evaluate_trade(trade)
+            if outcome is None:
+                continue  # not yet ready to close
 
-    **Performance-based Exits:**
-    - Stop Loss: Immediate exit if hit
-    - Take Profit: Immediate exit if hit
-    - Trailing Stop: Dynamic stop loss adjustment
+            _record_outcome(outcome)
 
-    **Market-based Exits:**
-    - Market Close: Close intraday positions
-    - Gap Risk: Exit before earnings or major news
-    - Volatility: Exit during extreme market conditions
+            # Trigger weight update
+            try:
+                from feedback.weights import update_weights
+                update_weights(outcome)
+            except Exception as e:
+                logger.warning(f"Weight update failed for {outcome['trade_id']}: {e}")
 
-    Outcome Calculation:
-    -------------------
-    Return = (Current Price - Entry Price) / Entry Price
-    Holding Period = Current Time - Entry Time (in hours)
+            results.append(outcome)
+        except Exception as e:
+            logger.error(f"Failed to measure trade {trade.get('trade_id', '?')}: {e}")
 
-    Classification:
-    - Return > +1%: WIN
-    - Return < -1%: LOSS
-    - Return -1% to +1%: NEUTRAL
+    logger.info(f"Measured {len(results)} outcomes out of {len(pending)} pending trades")
+    return results
 
-    Args:
-        db_path: Path to Turso database for trade and outcome data
 
-    Returns:
-        List of measured outcomes:
-        [
-            {
-                "trade_id": str,           # UUID from original trade
-                "ticker": str,             # Stock symbol
-                "outcome": str,            # "WIN", "LOSS", or "NEUTRAL"
-                "return_pct": float,       # Return percentage
-                "holding_period_hours": float,  # Hours held
-                "exit_price": float,       # Final exit price
-                "exit_reason": str,        # Why trade was closed
-                "measured_at": str         # ISO timestamp
-            }
+def _get_pending_trades() -> List[Dict[str, Any]]:
+    """Get trades with no outcome recorded yet."""
+    try:
+        from db.client import get_db
+        import json
+
+        db = get_db()
+        result = db.execute(
+            """
+            SELECT t.* FROM trades t
+            LEFT JOIN outcomes o ON t.trade_id = o.trade_id
+            WHERE o.trade_id IS NULL
+              AND t.order_id IS NOT NULL
+            ORDER BY t.created_at ASC
+            """
+        )
+
+        columns = [
+            "trade_id", "ticker", "signal", "confidence",
+            "sentiment_score", "sentiment_source", "strategies_fired",
+            "discovery_sources", "regime_mode", "article_urls",
+            "entry_price", "shares", "stop_loss_price", "take_profit_price",
+            "order_id", "created_at",
         ]
 
-    Example Output:
-    --------------
-    >>> outcomes = measure_outcomes("trader.db")
-    >>> for outcome in outcomes:
-    ...     print(f"{outcome['ticker']}: {outcome['outcome']} "
-    ...           f"({outcome['return_pct']:.1%}) after "
-    ...           f"{outcome['holding_period_hours']:.1f}h")
-    AAPL: WIN (+2.3%) after 6.5h
-    MSFT: LOSS (-1.8%) after 4.2h
-    GOOGL: NEUTRAL (+0.4%) after 8.0h
+        trades = []
+        for row in result.rows:
+            trade = dict(zip(columns, row))
+            trade["strategies_fired"] = json.loads(trade["strategies_fired"] or "[]")
+            trade["discovery_sources"] = json.loads(trade["discovery_sources"] or "[]")
+            trade["article_urls"] = json.loads(trade["article_urls"] or "[]")
+            trades.append(trade)
 
-    Error Handling:
-    --------------
-    - Price fetch failures: Use last known price with warning
-    - Database errors: Log and continue with available data
-    - Position mismatches: Alert but don't crash measurement
-    - Clock synchronization: Handle timezone differences gracefully
+        return trades
+    except Exception as e:
+        logger.error(f"Failed to fetch pending trades: {e}")
+        return []
 
-    Performance Impact:
-    ------------------
-    - Batched price fetching for efficiency
-    - Database updates in transactions
-    - Minimal market impact from measurement activity
-    - Cached results to avoid redundant calculations
 
-    Integration:
-    -----------
-    - Called by scheduler/loop.py on scheduled intervals
-    - Results feed into feedback/weights.py for learning
-    - Position changes sent to executor/alpaca.py for execution
-    - Outcomes displayed in dashboard/app.py for monitoring
+def _evaluate_trade(trade: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Evaluate a single trade and return an outcome dict if ready to close.
+
+    Returns None if the trade hasn't hit any exit criteria yet.
     """
-    raise NotImplementedError("Not yet implemented")
+    ticker = trade["ticker"]
+    entry_price = trade["entry_price"]
+    signal = trade["signal"]
+    created_at = trade["created_at"]
 
+    # Parse trade time
+    try:
+        trade_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        trade_time = datetime.now(timezone.utc) - timedelta(hours=DEFAULT_HOLDING_PERIOD + 1)
 
-def _get_pending_trades(db_path: str) -> List[Dict[str, Any]]:
-    """Retrieve all trades that haven't been measured for outcomes yet.
+    now = datetime.now(timezone.utc)
+    age_hours = (now - trade_time).total_seconds() / 3600
 
-    Queries the trades table for positions that:
-    - Have been executed successfully (have order_id)
-    - Don't have corresponding entry in outcomes table
-    - Are within reasonable time window for measurement
-    - Haven't been manually closed or cancelled
+    # Fetch current price
+    current_price = _fetch_current_price(ticker)
+    if current_price is None or current_price <= 0:
+        logger.warning(f"Could not fetch price for {ticker}, skipping")
+        return None
 
-    Database Query Logic:
-    --------------------
-    ```sql
-    SELECT t.* FROM trades t
-    LEFT JOIN outcomes o ON t.trade_id = o.trade_id
-    WHERE o.trade_id IS NULL
-    AND t.order_id IS NOT NULL
-    AND t.created_at > datetime('now', '-7 days')
-    ORDER BY t.created_at ASC
-    ```
+    # Calculate return
+    if signal == "BUY":
+        return_pct = (current_price - entry_price) / entry_price
+    else:  # SELL
+        return_pct = (entry_price - current_price) / entry_price
 
-    Data Enrichment:
-    ---------------
-    Adds calculated fields to trade data:
-    - Age in hours since execution
-    - Expected holding period based on strategy
-    - Current status (open, approaching exit, overdue)
+    # Check exit criteria
+    stop_loss = trade.get("stop_loss_price")
+    take_profit = trade.get("take_profit_price")
+    exit_reason = None
 
-    Args:
-        db_path: Database connection string for trade lookup
+    if signal == "BUY":
+        if stop_loss and current_price <= stop_loss:
+            exit_reason = "stop_loss"
+        elif take_profit and current_price >= take_profit:
+            exit_reason = "take_profit"
+    else:  # SELL
+        if stop_loss and current_price >= stop_loss:
+            exit_reason = "stop_loss"
+        elif take_profit and current_price <= take_profit:
+            exit_reason = "take_profit"
 
-    Returns:
-        List of pending trade records with metadata:
-        [
-            {
-                "trade_id": str,
-                "ticker": str,
-                "signal": str,
-                "entry_price": float,
-                "shares": int,
-                "stop_loss_price": float,
-                "take_profit_price": float,
-                "created_at": str,
-                "age_hours": float,
-                "target_holding_hours": float
-            }
-        ]
-    """
-    raise NotImplementedError("Not yet implemented")
+    # Time-based exit
+    if exit_reason is None and age_hours >= DEFAULT_HOLDING_PERIOD:
+        exit_reason = "holding_period"
+
+    # Not ready to close yet
+    if exit_reason is None:
+        return None
+
+    outcome = _classify_outcome(return_pct)
+
+    return {
+        "trade_id": trade["trade_id"],
+        "ticker": ticker,
+        "signal": signal,
+        "outcome": outcome,
+        "return_pct": round(return_pct, 6),
+        "exit_price": current_price,
+        "holding_period_hours": round(age_hours, 2),
+        "exit_reason": exit_reason,
+        "measured_at": now.isoformat(),
+        # Attribution data for weight updates
+        "strategies_fired": trade.get("strategies_fired", []),
+        "sentiment_source": trade.get("sentiment_source"),
+        "discovery_sources": trade.get("discovery_sources", []),
+    }
 
 
 def _classify_outcome(return_pct: float) -> str:
-    """Classify trade return percentage into outcome category.
+    """Classify trade return into WIN / LOSS / NEUTRAL."""
+    if return_pct > WIN_THRESHOLD:
+        return "WIN"
+    elif return_pct < LOSS_THRESHOLD:
+        return "LOSS"
+    return "NEUTRAL"
 
-    Uses fixed thresholds to categorize trade performance:
-    - Meaningful wins and losses are separated from noise
-    - Conservative thresholds focus learning on clear signals
-    - Neutral zone prevents overreaction to small movements
 
-    Classification Logic:
-    --------------------
-    - WIN: Return > +1.0% (meaningful profit)
-    - LOSS: Return < -1.0% (meaningful loss)
-    - NEUTRAL: -1.0% ≤ Return ≤ +1.0% (noise/uncertain)
+def _record_outcome(outcome: Dict[str, Any]) -> None:
+    """Write outcome to the DB."""
+    try:
+        from db.client import log_outcome
+        log_outcome(
+            trade_id=outcome["trade_id"],
+            exit_price=outcome["exit_price"],
+            return_pct=outcome["return_pct"],
+            outcome=outcome["outcome"],
+            holding_period_hours=outcome["holding_period_hours"],
+        )
+    except Exception as e:
+        logger.error(f"Failed to record outcome for {outcome['trade_id']}: {e}")
+        raise
 
-    The 1% threshold is chosen to:
-    - Exceed typical bid-ask spreads and transaction costs
-    - Focus on trades with clear directional outcomes
-    - Avoid over-fitting to random market noise
-    - Provide meaningful signal for strategy adjustment
 
-    Learning Implications:
-    ---------------------
-    - WIN outcomes: Increase weights for contributing strategies/sources
-    - LOSS outcomes: Decrease weights for contributing strategies/sources
-    - NEUTRAL outcomes: No weight adjustments (insufficient signal)
-
-    Args:
-        return_pct: Trade return as decimal (0.02 = 2%)
-
-    Returns:
-        Outcome classification: "WIN", "LOSS", or "NEUTRAL"
-
-    Example Classifications:
-    -----------------------
-    >>> _classify_outcome(0.025)   # +2.5% return
-    "WIN"
-    >>> _classify_outcome(-0.018)  # -1.8% return
-    "LOSS"
-    >>> _classify_outcome(0.005)   # +0.5% return
-    "NEUTRAL"
-    >>> _classify_outcome(-0.003)  # -0.3% return
-    "NEUTRAL"
-    """
-    raise NotImplementedError("Not yet implemented")
+def _fetch_current_price(ticker: str) -> Optional[float]:
+    """Fetch current price for a ticker via yfinance."""
+    try:
+        import yfinance as yf
+        data = yf.Ticker(ticker).history(period="1d")
+        if not data.empty:
+            return float(data["Close"].iloc[-1])
+    except Exception as e:
+        logger.warning(f"yfinance price fetch failed for {ticker}: {e}")
+    return None

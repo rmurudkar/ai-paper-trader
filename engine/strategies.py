@@ -1,39 +1,28 @@
-"""Trading strategy signals for autonomous paper trading system.
+"""Raw signal and modifier generation for autonomous paper trading system.
 
-Strategies are split into two categories:
+This module generates raw, unweighted signals and modifiers. All orchestration
+(regime weighting, modifier application, threshold gating) belongs in
+engine/combiner.py.
 
 Category 1 — Sentiment-Reactive (highest edge):
-  These exploit the fact that tickers were selected BECAUSE they're in the news.
-  News-driven stocks have higher volatility, higher volume, and price action
-  driven by sentiment waves rather than technicals.
   - sentiment_price_divergence: Detects gaps between sentiment and price action.
   - multi_source_consensus: Fires when 3+ articles from 2+ sources all agree.
   - sentiment_momentum: Fires when sentiment shifts > 0.4 between cycles.
 
 Category 3 — News-Catalyst Momentum (post-news drift):
-  Exploits the well-documented post-news drift effect: stocks continue
-  moving in the direction of their initial news reaction for 1-5 days.
   - news_catalyst_drift: BUY/SELL when a gap is sustained near the day's extreme.
 
 Category 2 — Technical Confirmation (modifiers, not standalone signals):
-  These retrofit technical indicators as confidence modifiers applied to
-  Category 1 signals. On news-driven stocks, technicals confirm or weaken
-  sentiment signals rather than generating independent trades.
   - volume_confirmation: Scales confidence by volume relative to average.
   - vwap_position: Directional modifier based on price vs VWAP.
   - relative_strength: Modifier based on ticker performance vs SPY.
-  - momentum: Trend-following via MA relationships (kept as standalone).
-  - mean_reversion: Counter-trend via RSI levels (kept as standalone).
 
-Regime-Adaptive Weighting:
-  The macro regime (risk-on / risk-off / neutral) controls which strategies
-  dominate rather than acting as a simple binary toggle:
-  - Risk-On:  sentiment strategies 2x, momentum 1.5x, mean reversion 0.5x
-  - Risk-Off: kill BUY < 0.8, mean reversion 2x, volume confirmation 2x
-  - Neutral:  all weights 1x (no adjustment)
+Standalone Technical Strategies:
+  - momentum: Trend-following via MA relationships.
+  - mean_reversion: Counter-trend via RSI levels.
 
-Category 1 strategies return: {"signal", "confidence", "strategy", "reason"}
-Category 2 modifiers return: {"multiplier", "modifier", "reason"}
+Category 1/3/standalone return: {"signal", "confidence", "strategy", "reason"}
+Category 2 modifiers return: {"multiplier"|"directional_modifier", "modifier_name", "reason"}
 """
 
 import logging
@@ -49,38 +38,34 @@ def run_all_strategies(
     market_data: Dict[str, Any],
     sentiment_data: Optional[Dict[str, Any]] = None,
     macro_data: Optional[Dict[str, Any]] = None,
-    regime_data: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    """Execute all strategies for a single ticker with regime-adaptive weighting.
+) -> Dict[str, Any]:
+    """Generate raw signals and modifiers for a single ticker.
 
-    Pipeline:
-    1. Run all signal generators (Cat 1 + Cat 3 + standalone technicals)
-    2. Apply regime-based strategy weight multipliers
-    3. In risk-off: kill weak BUY signals (confidence < 0.8)
-    4. Compute confirmation modifiers (Cat 2) with regime-adjusted weights
-    5. Apply modifiers to all surviving signals
-    6. Clamp and tag
+    Returns raw, unweighted output. All orchestration (regime weighting,
+    modifier application, signal combination, threshold gating) belongs
+    in engine/combiner.py.
 
     Args:
         ticker: Stock ticker symbol
         market_data: From fetchers/market.py per-ticker data
         sentiment_data: From engine/sentiment.py get_ticker_sentiment_scores()
         macro_data: From fetchers/market.py macro indicators (spy_change_pct, etc.)
-        regime_data: From engine/regime.py get_current_regime()
-                    {"regime": "risk_on"|"risk_off"|"neutral", "confidence": float}
-    """
-    regime = (regime_data or {}).get("regime", "neutral")
-    strategy_weights = _get_regime_strategy_weights(regime)
-    modifier_weights = _get_regime_modifier_weights(regime)
 
+    Returns:
+        Dict with:
+            signals: List of raw signal dicts (non-HOLD only), each with
+                     signal, confidence, strategy, reason.
+            modifiers: List of modifier dicts, each with
+                       multiplier or directional_modifier, modifier_name, reason.
+    """
     signals = []
 
-    # Category 1 + 3 + standalone: Signal generators
+    # Category 1 + Cat 3 + standalone: Signal generators
     signal_fns = [
         lambda: sentiment_price_divergence(ticker, market_data, sentiment_data),
         lambda: multi_source_consensus(ticker, sentiment_data),
         lambda: sentiment_momentum(ticker, sentiment_data),
-        lambda: news_catalyst_drift(ticker, market_data),
+        lambda: news_catalyst_drift(ticker, market_data, sentiment_data),
         lambda: momentum_signal(ticker, market_data),
         lambda: mean_reversion_signal(ticker, market_data),
     ]
@@ -93,36 +78,7 @@ def run_all_strategies(
         except Exception as e:
             logger.error(f"Strategy failed for {ticker}: {e}")
 
-    if not signals:
-        return signals
-
-    # Apply regime-based strategy weight multipliers
-    for signal in signals:
-        strategy_name = signal["strategy"]
-        weight = strategy_weights.get(strategy_name, 1.0)
-        if weight != 1.0:
-            signal["confidence"] *= weight
-            signal.setdefault("modifiers_applied", []).append(
-                f"Regime {regime}: {strategy_name} weight {weight}x"
-            )
-
-    # Risk-off gate: kill weak BUY signals
-    if regime == "risk_off":
-        surviving = []
-        for signal in signals:
-            if signal["signal"] == "BUY" and signal["confidence"] < 0.8:
-                logger.info(
-                    f"Risk-off: killed weak BUY for {ticker} "
-                    f"({signal['strategy']}, confidence {signal['confidence']:.2f})"
-                )
-                continue
-            surviving.append(signal)
-        signals = surviving
-
-    if not signals:
-        return signals
-
-    # Category 2: Confirmation modifiers with regime-adjusted weights
+    # Category 2: Confirmation modifiers (raw, no regime scaling)
     modifiers = []
     modifier_fns = [
         ("volume_confirmation", lambda: volume_confirmation(market_data)),
@@ -134,104 +90,72 @@ def run_all_strategies(
         try:
             mod = fn()
             if mod:
-                mod["_regime_weight"] = modifier_weights.get(mod_name, 1.0)
+                mod["modifier_name"] = mod_name
                 modifiers.append(mod)
         except Exception as e:
             logger.error(f"Modifier failed for {ticker}: {e}")
 
-    # Apply modifiers to each signal
-    for signal in signals:
-        modifier_notes = signal.get("modifiers_applied", [])
-
-        for mod in modifiers:
-            signal_direction = signal["signal"]
-            regime_weight = mod.get("_regime_weight", 1.0)
-
-            if "multiplier" in mod:
-                # Scale the multiplier effect by regime weight
-                # e.g. multiplier=1.4, regime_weight=2.0 → effective=1.8
-                base_effect = mod["multiplier"] - 1.0  # deviation from 1.0
-                adjusted_effect = base_effect * regime_weight
-                effective_multiplier = 1.0 + adjusted_effect
-
-                signal["confidence"] *= effective_multiplier
-                if effective_multiplier != 1.0:
-                    modifier_notes.append(mod["reason"])
-
-            if "directional_modifier" in mod:
-                dm = mod["directional_modifier"] * regime_weight
-                if signal_direction == "BUY":
-                    signal["confidence"] *= (1.0 + dm)
-                else:
-                    signal["confidence"] *= (1.0 - dm)
-                if dm != 0.0:
-                    modifier_notes.append(mod["reason"])
-
-        signal["confidence"] = round(max(0.05, min(0.95, signal["confidence"])), 3)
-        signal["regime"] = regime
-
-        if modifier_notes:
-            signal["modifiers_applied"] = modifier_notes
-
-    return signals
+    return {"signals": signals, "modifiers": modifiers}
 
 
 # ---------------------------------------------------------------------------
-# Regime-Adaptive Strategy Weighting
+# Enrichment boost: urgency, materiality, time_horizon
 # ---------------------------------------------------------------------------
 
-SENTIMENT_STRATEGIES = {"sentiment_divergence", "multi_source_consensus", "sentiment_momentum"}
-
-_REGIME_STRATEGY_WEIGHTS: Dict[str, Dict[str, float]] = {
-    "risk_on": {
-        # Sentiment strategies dominate — news drives risk-on markets
-        "sentiment_divergence": 2.0,
-        "multi_source_consensus": 2.0,
-        "sentiment_momentum": 2.0,
-        # Momentum confirms the trend
-        "momentum": 1.5,
-        "news_catalyst_drift": 1.5,
-        # Don't fight the trend
-        "mean_reversion": 0.5,
-    },
-    "risk_off": {
-        # Sentiment less trusted in panic — everyone's bearish
-        "sentiment_divergence": 1.0,
-        "multi_source_consensus": 1.0,
-        "sentiment_momentum": 1.0,
-        # Mean reversion shines — buy oversold quality names
-        "mean_reversion": 2.0,
-        # Momentum can work for shorts
-        "momentum": 1.0,
-        "news_catalyst_drift": 0.7,
-    },
-    "neutral": {},  # all 1.0
+# Urgency: breaking news demands faster action and carries more edge
+_URGENCY_CONFIDENCE_BOOST = {
+    "breaking": 1.25,
+    "developing": 1.1,
+    "standard": 1.0,
 }
 
-_REGIME_MODIFIER_WEIGHTS: Dict[str, Dict[str, float]] = {
-    "risk_on": {
-        "volume_confirmation": 1.0,
-        "vwap_position": 1.0,
-        "relative_strength": 1.0,
-    },
-    "risk_off": {
-        # Only trade with conviction in risk-off
-        "volume_confirmation": 2.0,
-        "vwap_position": 1.0,
-        "relative_strength": 1.5,
-    },
-    "neutral": {},
+# Materiality: high-materiality events move prices more and for longer
+_MATERIALITY_CONFIDENCE_BOOST = {
+    "high": 1.2,
+    "medium": 1.1,
+    "low": 1.0,
+    "unknown": 1.0,
+}
+
+# Time horizon: intraday catalysts are most actionable on a 15-min loop
+_TIME_HORIZON_CONFIDENCE_BOOST = {
+    "intraday": 1.15,
+    "short_term": 1.05,
+    "medium_term": 1.0,
+    "long_term": 0.9,
 }
 
 
-def _get_regime_strategy_weights(regime: str) -> Dict[str, float]:
-    """Get strategy confidence multipliers for the given regime."""
-    return _REGIME_STRATEGY_WEIGHTS.get(regime, {})
+def _apply_enrichment_boost(
+    confidence: float,
+    sentiment_data: Dict[str, Any],
+) -> tuple:
+    """Apply urgency, materiality, and time horizon boosts to confidence.
 
+    Returns (boosted_confidence, list_of_notes) so strategies can log
+    which enrichment factors contributed.
+    """
+    notes = []
 
-def _get_regime_modifier_weights(regime: str) -> Dict[str, float]:
-    """Get modifier weight scalers for the given regime."""
-    return _REGIME_MODIFIER_WEIGHTS.get(regime, {})
+    urgency = sentiment_data.get("urgency", "standard")
+    urgency_mult = _URGENCY_CONFIDENCE_BOOST.get(urgency, 1.0)
+    if urgency_mult != 1.0:
+        confidence *= urgency_mult
+        notes.append(f"urgency={urgency} ({urgency_mult}x)")
+
+    materiality = sentiment_data.get("materiality", "unknown")
+    mat_mult = _MATERIALITY_CONFIDENCE_BOOST.get(materiality, 1.0)
+    if mat_mult != 1.0:
+        confidence *= mat_mult
+        notes.append(f"materiality={materiality} ({mat_mult}x)")
+
+    time_horizon = sentiment_data.get("time_horizon", "medium_term")
+    th_mult = _TIME_HORIZON_CONFIDENCE_BOOST.get(time_horizon, 1.0)
+    if th_mult != 1.0:
+        confidence *= th_mult
+        notes.append(f"time_horizon={time_horizon} ({th_mult}x)")
+
+    return confidence, notes
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +203,12 @@ def sentiment_price_divergence(
     if source_count >= 2:
         confidence = min(0.95, confidence * 1.05)
 
-    confidence = round(confidence, 3)
+    # Enrichment boost: urgency, materiality, time horizon
+    confidence, enrich_notes = _apply_enrichment_boost(confidence, sentiment_data)
+
+    confidence = round(max(0.1, min(0.95, confidence)), 3)
+
+    enrich_tag = f" [{', '.join(enrich_notes)}]" if enrich_notes else ""
 
     # BUY: bullish sentiment, price hasn't moved up yet
     if sentiment_score > 0.5 and price_change_pct < 0.5:
@@ -290,7 +219,7 @@ def sentiment_price_divergence(
             "reason": (
                 f"Bullish sentiment ({sentiment_score:+.2f}) but price flat/down "
                 f"({price_change_pct:+.1f}%) — market hasn't priced in the news "
-                f"({article_count} articles, {source_count} sources)"
+                f"({article_count} articles, {source_count} sources){enrich_tag}"
             ),
         }
 
@@ -303,7 +232,7 @@ def sentiment_price_divergence(
             "reason": (
                 f"Bearish sentiment ({sentiment_score:+.2f}) but price flat/up "
                 f"({price_change_pct:+.1f}%) — market hasn't priced in the news "
-                f"({article_count} articles, {source_count} sources)"
+                f"({article_count} articles, {source_count} sources){enrich_tag}"
             ),
         }
 
@@ -344,10 +273,15 @@ def multi_source_consensus(
         return {**hold, "reason": "Mixed signals across sources — no consensus"}
 
     avg_magnitude = sum(abs(s) for s in individual_scores) / len(individual_scores)
-    confidence = round(min(article_count / 5.0, 1.0) * avg_magnitude, 3)
-    confidence = max(0.1, min(0.95, confidence))
+    confidence = min(article_count / 5.0, 1.0) * avg_magnitude
+
+    # Enrichment boost: urgency, materiality, time horizon
+    confidence, enrich_notes = _apply_enrichment_boost(confidence, sentiment_data)
+
+    confidence = round(max(0.1, min(0.95, confidence)), 3)
 
     source_list = ", ".join(sorted(source_breakdown.keys()))
+    enrich_tag = f" [{', '.join(enrich_notes)}]" if enrich_notes else ""
 
     if all_bullish:
         return {
@@ -356,7 +290,7 @@ def multi_source_consensus(
             "strategy": "multi_source_consensus",
             "reason": (
                 f"Consensus bullish: {article_count} articles from {len(source_breakdown)} sources "
-                f"({source_list}) all score > +0.3"
+                f"({source_list}) all score > +0.3{enrich_tag}"
             ),
         }
 
@@ -366,7 +300,7 @@ def multi_source_consensus(
         "strategy": "multi_source_consensus",
         "reason": (
             f"Consensus bearish: {article_count} articles from {len(source_breakdown)} sources "
-            f"({source_list}) all score < -0.3"
+            f"({source_list}) all score < -0.3{enrich_tag}"
         ),
     }
 
@@ -410,7 +344,14 @@ def sentiment_momentum(
     if abs(delta) < 0.4:
         return {**hold, "reason": f"Sentiment stable (delta {delta:+.2f})"}
 
-    confidence = round(min(abs(delta) / 1.0, 0.95), 3)
+    confidence = min(abs(delta) / 1.0, 0.95)
+
+    # Enrichment boost: urgency, materiality, time horizon
+    confidence, enrich_notes = _apply_enrichment_boost(confidence, sentiment_data)
+
+    confidence = round(max(0.1, min(0.95, confidence)), 3)
+
+    enrich_tag = f" [{', '.join(enrich_notes)}]" if enrich_notes else ""
 
     if delta > 0.4:
         return {
@@ -419,7 +360,7 @@ def sentiment_momentum(
             "strategy": "sentiment_momentum",
             "reason": (
                 f"Sentiment shifting bullish: {previous_score:+.2f} → {current_score:+.2f} "
-                f"(delta {delta:+.2f})"
+                f"(delta {delta:+.2f}){enrich_tag}"
             ),
         }
 
@@ -429,7 +370,7 @@ def sentiment_momentum(
         "strategy": "sentiment_momentum",
         "reason": (
             f"Sentiment shifting bearish: {previous_score:+.2f} → {current_score:+.2f} "
-            f"(delta {delta:+.2f})"
+            f"(delta {delta:+.2f}){enrich_tag}"
         ),
     }
 
@@ -438,7 +379,11 @@ def sentiment_momentum(
 # Category 3: News-Catalyst Momentum (Post-News Drift)
 # ---------------------------------------------------------------------------
 
-def news_catalyst_drift(ticker: str, market_data: Dict[str, Any]) -> Dict[str, Any]:
+def news_catalyst_drift(
+    ticker: str,
+    market_data: Dict[str, Any],
+    sentiment_data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Trade the post-news drift: stocks continue moving in the direction
     of their initial reaction to news for 1-5 days.
 
@@ -453,6 +398,7 @@ def news_catalyst_drift(ticker: str, market_data: Dict[str, Any]) -> Dict[str, A
     Confidence is higher when:
     - The gap is larger (stronger catalyst)
     - Price is closer to the extreme (drift intact)
+    - Urgency/materiality are high (enrichment boost)
     """
     hold = {"signal": "HOLD", "confidence": 0.0, "strategy": "news_catalyst_drift", "reason": ""}
 
@@ -481,7 +427,14 @@ def news_catalyst_drift(ticker: str, market_data: Dict[str, Any]) -> Dict[str, A
         # Confidence: larger gap + closer to high = stronger
         gap_factor = min(gap_pct / 5.0, 1.0)  # 5%+ gap = max gap factor
         proximity_factor = 1.0 - distance_from_high_pct  # closer to high = higher
-        confidence = round(max(0.3, min(0.85, gap_factor * 0.6 + proximity_factor * 0.3)), 3)
+        confidence = max(0.3, min(0.85, gap_factor * 0.6 + proximity_factor * 0.3))
+
+        enrich_tag = ""
+        if sentiment_data:
+            confidence, enrich_notes = _apply_enrichment_boost(confidence, sentiment_data)
+            enrich_tag = f" [{', '.join(enrich_notes)}]" if enrich_notes else ""
+
+        confidence = round(max(0.3, min(0.95, confidence)), 3)
 
         return {
             "signal": "BUY",
@@ -489,7 +442,7 @@ def news_catalyst_drift(ticker: str, market_data: Dict[str, Any]) -> Dict[str, A
             "strategy": "news_catalyst_drift",
             "reason": (
                 f"Post-news drift: gapped up {gap_pct:+.1f}%, "
-                f"holding {distance_from_high_pct:.1f}% from day high"
+                f"holding {distance_from_high_pct:.1f}% from day high{enrich_tag}"
             ),
         }
 
@@ -503,7 +456,14 @@ def news_catalyst_drift(ticker: str, market_data: Dict[str, Any]) -> Dict[str, A
 
     gap_factor = min(abs(gap_pct) / 5.0, 1.0)
     proximity_factor = 1.0 - distance_from_low_pct
-    confidence = round(max(0.3, min(0.85, gap_factor * 0.6 + proximity_factor * 0.3)), 3)
+    confidence = max(0.3, min(0.85, gap_factor * 0.6 + proximity_factor * 0.3))
+
+    enrich_tag = ""
+    if sentiment_data:
+        confidence, enrich_notes = _apply_enrichment_boost(confidence, sentiment_data)
+        enrich_tag = f" [{', '.join(enrich_notes)}]" if enrich_notes else ""
+
+    confidence = round(max(0.3, min(0.95, confidence)), 3)
 
     return {
         "signal": "SELL",
@@ -511,7 +471,7 @@ def news_catalyst_drift(ticker: str, market_data: Dict[str, Any]) -> Dict[str, A
         "strategy": "news_catalyst_drift",
         "reason": (
             f"Post-news drift: gapped down {gap_pct:+.1f}%, "
-            f"holding {distance_from_low_pct:.1f}% from day low"
+            f"holding {distance_from_low_pct:.1f}% from day low{enrich_tag}"
         ),
     }
 

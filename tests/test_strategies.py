@@ -18,6 +18,7 @@ from engine.strategies import (
     relative_strength,
     momentum_signal,
     mean_reversion_signal,
+    _apply_enrichment_boost,
 )
 
 
@@ -516,6 +517,7 @@ class TestRelativeStrength(unittest.TestCase):
 
 @patch("engine.strategies.get_previous_sentiment", return_value=None)
 class TestRunAllStrategies(unittest.TestCase):
+    """Test run_all_strategies returns raw signals and modifiers dict."""
 
     def _market(self, **overrides):
         base = {"price": 175, "ma_20": 170, "ma_50": 165, "rsi": 50,
@@ -524,257 +526,281 @@ class TestRunAllStrategies(unittest.TestCase):
         base.update(overrides)
         return base
 
-    def test_returns_only_non_hold_signals(self, _):
-        """run_all_strategies should filter out HOLD signals."""
-        sentiment = {"sentiment_score": 0.7, "article_count": 2,
-                     "source_breakdown": {"marketaux": 1, "newsapi": 1}, "confidence": 0.5,
-                     "individual_scores": [0.7, 0.7]}
+    def _sentiment(self, **overrides):
+        base = {"sentiment_score": 0.7, "article_count": 2,
+                "source_breakdown": {"marketaux": 1, "newsapi": 1}, "confidence": 0.5,
+                "individual_scores": [0.7, 0.7]}
+        base.update(overrides)
+        return base
 
-        signals = run_all_strategies("AAPL", self._market(), sentiment)
+    def test_returns_dict_with_signals_and_modifiers(self, _):
+        """run_all_strategies should return a dict with signals and modifiers keys."""
+        result = run_all_strategies("AAPL", self._market(), self._sentiment())
+        self.assertIsInstance(result, dict)
+        self.assertIn("signals", result)
+        self.assertIn("modifiers", result)
+        self.assertIsInstance(result["signals"], list)
+        self.assertIsInstance(result["modifiers"], list)
 
-        for s in signals:
+    def test_signals_are_raw_no_regime(self, _):
+        """Signals should not contain regime tags or modifiers_applied."""
+        result = run_all_strategies("AAPL", self._market(), self._sentiment())
+        for s in result["signals"]:
+            self.assertNotIn("regime", s)
+            self.assertNotIn("modifiers_applied", s)
+            self.assertIn("signal", s)
+            self.assertIn("confidence", s)
+            self.assertIn("strategy", s)
+            self.assertIn("reason", s)
+
+    def test_signals_filter_hold(self, _):
+        """Signals list should not contain HOLD entries."""
+        result = run_all_strategies("AAPL", self._market(), self._sentiment())
+        for s in result["signals"]:
             self.assertNotEqual(s["signal"], "HOLD")
 
     def test_includes_sentiment_strategies(self, _):
         """Should include sentiment strategies when sentiment data present."""
-        sentiment = {"sentiment_score": 0.8, "article_count": 3,
-                     "source_breakdown": {"marketaux": 1, "newsapi": 2}, "confidence": 0.6,
-                     "individual_scores": [0.7, 0.85, 0.75]}
-
-        signals = run_all_strategies("AAPL", self._market(), sentiment)
-        strategy_names = [s["strategy"] for s in signals]
+        sentiment = self._sentiment(sentiment_score=0.8, article_count=3,
+                                    source_breakdown={"marketaux": 1, "newsapi": 2},
+                                    individual_scores=[0.7, 0.85, 0.75])
+        result = run_all_strategies("AAPL", self._market(), sentiment)
+        strategy_names = [s["strategy"] for s in result["signals"]]
         self.assertIn("sentiment_divergence", strategy_names)
         self.assertIn("multi_source_consensus", strategy_names)
 
     def test_works_without_sentiment(self, _):
         """Should work with no sentiment data (technical strategies only)."""
         market = self._market(price=180, ma_20=175, ma_50=170, rsi=25, price_change_pct=1.5)
-
-        signals = run_all_strategies("AAPL", market)
-        self.assertIsInstance(signals, list)
-        strategy_names = [s["strategy"] for s in signals]
+        result = run_all_strategies("AAPL", market)
+        self.assertIsInstance(result["signals"], list)
+        strategy_names = [s["strategy"] for s in result["signals"]]
         self.assertNotIn("sentiment_divergence", strategy_names)
 
-    def test_volume_modifier_boosts_confidence(self, _):
-        """High volume should boost signal confidence via modifier."""
-        sentiment = {"sentiment_score": 0.7, "article_count": 2,
-                     "source_breakdown": {"marketaux": 1, "newsapi": 1}, "confidence": 0.5,
-                     "individual_scores": [0.7, 0.7]}
+    def test_modifiers_have_modifier_name(self, _):
+        """Each modifier should carry a modifier_name field."""
+        result = run_all_strategies("AAPL", self._market(), self._sentiment())
+        for m in result["modifiers"]:
+            self.assertIn("modifier_name", m)
+            self.assertIn(m["modifier_name"],
+                          {"volume_confirmation", "vwap_position", "relative_strength"})
 
-        normal_vol = self._market(volume=45_000_000, avg_volume_20=45_000_000)
-        high_vol = self._market(volume=100_000_000, avg_volume_20=45_000_000)
+    def test_modifiers_include_volume(self, _):
+        """Volume confirmation should appear in modifiers."""
+        market = self._market(volume=100_000_000, avg_volume_20=45_000_000)
+        result = run_all_strategies("AAPL", market, self._sentiment())
+        vol_mods = [m for m in result["modifiers"] if m["modifier_name"] == "volume_confirmation"]
+        self.assertEqual(len(vol_mods), 1)
+        self.assertIn("multiplier", vol_mods[0])
 
-        signals_normal = run_all_strategies("AAPL", normal_vol, sentiment)
-        signals_high = run_all_strategies("AAPL", high_vol, sentiment)
+    def test_modifiers_include_relative_strength_with_macro(self, _):
+        """Relative strength should appear when macro data is provided."""
+        macro = {"spy_change_pct": -2.0}
+        result = run_all_strategies("AAPL", self._market(), self._sentiment(), macro)
+        rs_mods = [m for m in result["modifiers"] if m["modifier_name"] == "relative_strength"]
+        self.assertEqual(len(rs_mods), 1)
+        self.assertIn("directional_modifier", rs_mods[0])
 
-        div_normal = next(s for s in signals_normal if s["strategy"] == "sentiment_divergence")
-        div_high = next(s for s in signals_high if s["strategy"] == "sentiment_divergence")
-
-        self.assertGreater(div_high["confidence"], div_normal["confidence"])
-
-    def test_low_volume_dampens_confidence(self, _):
-        """Low volume should reduce signal confidence."""
-        sentiment = {"sentiment_score": 0.7, "article_count": 2,
-                     "source_breakdown": {"marketaux": 1, "newsapi": 1}, "confidence": 0.5,
-                     "individual_scores": [0.7, 0.7]}
-
-        normal_vol = self._market(volume=45_000_000, avg_volume_20=45_000_000)
-        low_vol = self._market(volume=25_000_000, avg_volume_20=45_000_000)
-
-        signals_normal = run_all_strategies("AAPL", normal_vol, sentiment)
-        signals_low = run_all_strategies("AAPL", low_vol, sentiment)
-
-        div_normal = next(s for s in signals_normal if s["strategy"] == "sentiment_divergence")
-        div_low = next(s for s in signals_low if s["strategy"] == "sentiment_divergence")
-
-        self.assertLess(div_low["confidence"], div_normal["confidence"])
-
-    def test_modifiers_applied_tracked(self, _):
-        """Signals should track which modifiers were applied."""
-        sentiment = {"sentiment_score": 0.7, "article_count": 2,
-                     "source_breakdown": {"marketaux": 1, "newsapi": 1}, "confidence": 0.5,
-                     "individual_scores": [0.7, 0.7]}
-        market = self._market(volume=100_000_000, vwap=170)
-
-        signals = run_all_strategies("AAPL", market, sentiment)
-        div_signal = next(s for s in signals if s["strategy"] == "sentiment_divergence")
-
-        self.assertIn("modifiers_applied", div_signal)
-        self.assertGreater(len(div_signal["modifiers_applied"]), 0)
-
-    def test_relative_strength_with_macro(self, _):
-        """Outperforming SPY should boost BUY confidence."""
-        sentiment = {"sentiment_score": 0.7, "article_count": 2,
-                     "source_breakdown": {"marketaux": 1, "newsapi": 1}, "confidence": 0.5,
-                     "individual_scores": [0.7, 0.7]}
-
-        market = self._market(price_change_pct=0.0)
-        macro_outperform = {"spy_change_pct": -2.0}
-
-        signals_with_macro = run_all_strategies("AAPL", market, sentiment, macro_outperform)
-        signals_without = run_all_strategies("AAPL", market, sentiment)
-
-        div_with = next(s for s in signals_with_macro if s["strategy"] == "sentiment_divergence")
-        div_without = next(s for s in signals_without if s["strategy"] == "sentiment_divergence")
-
-        self.assertGreater(div_with["confidence"], div_without["confidence"])
-
-    def test_confidence_stays_in_bounds(self, _):
-        """Even with multiple boosting modifiers, confidence should stay <= 0.95."""
-        sentiment = {"sentiment_score": 0.95, "article_count": 5,
-                     "source_breakdown": {"a": 2, "b": 3}, "confidence": 0.8,
-                     "individual_scores": [0.9, 0.95, 0.92, 0.93, 0.91]}
-        market = self._market(volume=200_000_000, vwap=160, price_change_pct=0.0)
-        macro = {"spy_change_pct": -3.0}
-
-        signals = run_all_strategies("AAPL", market, sentiment, macro)
-
-        for s in signals:
-            self.assertLessEqual(s["confidence"], 0.95)
-            self.assertGreaterEqual(s["confidence"], 0.05)
-
-    def test_signals_tagged_with_regime(self, _):
-        """All signals should carry the regime they were generated under."""
-        sentiment = {"sentiment_score": 0.7, "article_count": 2,
-                     "source_breakdown": {"marketaux": 1, "newsapi": 1}, "confidence": 0.5,
-                     "individual_scores": [0.7, 0.7]}
-        regime = {"regime": "risk_on", "confidence": 0.8}
-
-        signals = run_all_strategies("AAPL", self._market(), sentiment, regime_data=regime)
-
-        for s in signals:
-            self.assertEqual(s["regime"], "risk_on")
+    def test_no_regime_parameter(self, _):
+        """run_all_strategies should not accept regime_data parameter."""
+        import inspect
+        params = inspect.signature(run_all_strategies).parameters
+        self.assertNotIn("regime_data", params)
 
 
-@patch("engine.strategies.get_previous_sentiment", return_value=None)
-class TestRegimeAdaptation(unittest.TestCase):
-    """Test regime-adaptive strategy weighting."""
+class TestEnrichmentBoost(unittest.TestCase):
+    """Test _apply_enrichment_boost and its integration with strategies."""
+
+    def test_breaking_high_materiality_boost(self):
+        """Breaking + high materiality should boost ~1.5x."""
+        conf, notes = _apply_enrichment_boost(0.5, {
+            "urgency": "breaking",
+            "materiality": "high",
+            "time_horizon": "medium_term",
+        })
+        # 0.5 * 1.25 * 1.2 * 1.0 = 0.75
+        self.assertAlmostEqual(conf, 0.75, places=2)
+        self.assertEqual(len(notes), 2)  # urgency + materiality, not time_horizon
+
+    def test_standard_unknown_no_boost(self):
+        """Default enrichment values should not change confidence."""
+        conf, notes = _apply_enrichment_boost(0.6, {
+            "urgency": "standard",
+            "materiality": "unknown",
+            "time_horizon": "medium_term",
+        })
+        self.assertAlmostEqual(conf, 0.6, places=2)
+        self.assertEqual(len(notes), 0)
+
+    def test_developing_medium_boost(self):
+        """Developing + medium materiality → moderate boost."""
+        conf, notes = _apply_enrichment_boost(0.5, {
+            "urgency": "developing",
+            "materiality": "medium",
+            "time_horizon": "medium_term",
+        })
+        # 0.5 * 1.1 * 1.1 * 1.0 = 0.605
+        self.assertAlmostEqual(conf, 0.605, places=2)
+
+    def test_long_term_dampens(self):
+        """Long-term time horizon should slightly reduce confidence."""
+        conf, notes = _apply_enrichment_boost(0.5, {
+            "urgency": "standard",
+            "materiality": "unknown",
+            "time_horizon": "long_term",
+        })
+        # 0.5 * 1.0 * 1.0 * 0.9 = 0.45
+        self.assertAlmostEqual(conf, 0.45, places=2)
+        self.assertIn("time_horizon=long_term", notes[0])
+
+    def test_intraday_boosts(self):
+        """Intraday time horizon should boost confidence."""
+        conf, notes = _apply_enrichment_boost(0.5, {
+            "urgency": "standard",
+            "materiality": "unknown",
+            "time_horizon": "intraday",
+        })
+        # 0.5 * 1.0 * 1.0 * 1.15 = 0.575
+        self.assertAlmostEqual(conf, 0.575, places=2)
+
+    def test_max_boost_all_factors(self):
+        """Breaking + high + intraday = maximum boost."""
+        conf, notes = _apply_enrichment_boost(0.5, {
+            "urgency": "breaking",
+            "materiality": "high",
+            "time_horizon": "intraday",
+        })
+        # 0.5 * 1.25 * 1.2 * 1.15 = 0.8625
+        self.assertAlmostEqual(conf, 0.8625, places=3)
+        self.assertEqual(len(notes), 3)
+
+    def test_missing_fields_use_defaults(self):
+        """Missing enrichment fields should default to 1.0 multiplier."""
+        conf, notes = _apply_enrichment_boost(0.5, {})
+        self.assertAlmostEqual(conf, 0.5, places=2)
+        self.assertEqual(len(notes), 0)
+
+
+class TestEnrichmentInStrategies(unittest.TestCase):
+    """Test that enrichment boosts flow through actual strategies."""
 
     def _market(self, **overrides):
-        base = {"price": 175, "ma_20": 170, "ma_50": 165, "rsi": 50,
-                "price_change_pct": 0.0, "volume": 50_000_000, "avg_volume_20": 45_000_000,
-                "vwap": 174.0}
+        base = {"price": 175.0, "price_change_pct": 0.0, "ma_20": 170.0, "ma_50": 165.0,
+                "rsi": 50.0, "volume": 50_000_000, "avg_volume_20": 45_000_000}
         base.update(overrides)
         return base
 
-    def _sentiment(self):
-        return {"sentiment_score": 0.7, "article_count": 2,
-                "source_breakdown": {"marketaux": 1, "newsapi": 1}, "confidence": 0.5,
+    def _sentiment(self, **overrides):
+        base = {"sentiment_score": 0.7, "article_count": 2,
+                "source_breakdown": {"newsapi": 1, "marketaux": 1},
                 "individual_scores": [0.7, 0.7]}
+        base.update(overrides)
+        return base
 
-    def test_risk_on_boosts_sentiment_strategies(self, _):
-        """Risk-on should boost sentiment strategy confidence by 2x."""
-        market = self._market()
-        sentiment = self._sentiment()
+    def test_divergence_breaking_high_boosts_confidence(self):
+        """Breaking + high materiality should boost divergence confidence."""
+        plain = sentiment_price_divergence("AAPL", self._market(), self._sentiment())
+        boosted = sentiment_price_divergence("AAPL", self._market(), self._sentiment(
+            urgency="breaking", materiality="high", time_horizon="intraday",
+        ))
+        self.assertEqual(plain["signal"], "BUY")
+        self.assertEqual(boosted["signal"], "BUY")
+        self.assertGreater(boosted["confidence"], plain["confidence"])
 
-        neutral_signals = run_all_strategies("AAPL", market, sentiment, regime_data={"regime": "neutral"})
-        risk_on_signals = run_all_strategies("AAPL", market, sentiment, regime_data={"regime": "risk_on"})
+    def test_divergence_standard_unknown_unchanged(self):
+        """Standard/unknown enrichment should not change divergence confidence."""
+        plain = sentiment_price_divergence("AAPL", self._market(), self._sentiment())
+        with_defaults = sentiment_price_divergence("AAPL", self._market(), self._sentiment(
+            urgency="standard", materiality="unknown", time_horizon="medium_term",
+        ))
+        self.assertAlmostEqual(plain["confidence"], with_defaults["confidence"], places=3)
 
-        div_neutral = next(s for s in neutral_signals if s["strategy"] == "sentiment_divergence")
-        div_risk_on = next(s for s in risk_on_signals if s["strategy"] == "sentiment_divergence")
-
-        self.assertGreater(div_risk_on["confidence"], div_neutral["confidence"])
-
-    def test_risk_on_dampens_mean_reversion(self, _):
-        """Risk-on should halve mean reversion confidence (don't fight the trend)."""
-        # RSI oversold + positive price to trigger mean reversion
-        market = self._market(rsi=25, price_change_pct=1.0)
-
-        neutral_signals = run_all_strategies("AAPL", market, regime_data={"regime": "neutral"})
-        risk_on_signals = run_all_strategies("AAPL", market, regime_data={"regime": "risk_on"})
-
-        mr_neutral = next(s for s in neutral_signals if s["strategy"] == "mean_reversion")
-        mr_risk_on = next(s for s in risk_on_signals if s["strategy"] == "mean_reversion")
-
-        self.assertLess(mr_risk_on["confidence"], mr_neutral["confidence"])
-
-    def test_risk_off_kills_weak_buys(self, _):
-        """Risk-off should remove BUY signals below 0.8 confidence."""
-        market = self._market()
-        sentiment = self._sentiment()  # sentiment_divergence will produce ~0.7 confidence BUY
-
-        risk_off_signals = run_all_strategies(
-            "AAPL", market, sentiment, regime_data={"regime": "risk_off"}
+    def test_consensus_breaking_boosts(self):
+        """Multi-source consensus should be boosted by breaking urgency."""
+        base = self._sentiment(
+            article_count=4,
+            source_breakdown={"newsapi": 2, "marketaux": 2},
+            individual_scores=[0.5, 0.6, 0.5, 0.7],
         )
+        plain = multi_source_consensus("AAPL", base)
+        boosted = multi_source_consensus("AAPL", {**base, "urgency": "breaking", "materiality": "high"})
+        self.assertEqual(plain["signal"], "BUY")
+        self.assertEqual(boosted["signal"], "BUY")
+        self.assertGreater(boosted["confidence"], plain["confidence"])
 
-        # sentiment_divergence BUY with 0.7 base confidence should be killed
-        for s in risk_off_signals:
-            if s["signal"] == "BUY":
-                self.assertGreaterEqual(s["confidence"], 0.05)
-                # Any surviving BUY must have had >= 0.8 confidence pre-gate
+    @patch("engine.strategies.get_previous_sentiment")
+    def test_momentum_breaking_boosts(self, mock_prev):
+        """Sentiment momentum should be boosted by enrichment."""
+        mock_prev.return_value = {"sentiment_score": -0.3, "article_count": 2, "recorded_at": "..."}
+        plain = sentiment_momentum("AAPL", self._sentiment(sentiment_score=0.5))
+        boosted = sentiment_momentum("AAPL", self._sentiment(
+            sentiment_score=0.5, urgency="breaking", materiality="high",
+        ))
+        self.assertEqual(plain["signal"], "BUY")
+        self.assertEqual(boosted["signal"], "BUY")
+        self.assertGreater(boosted["confidence"], plain["confidence"])
 
-    def test_risk_off_keeps_sell_signals(self, _):
-        """Risk-off should keep SELL signals intact."""
-        # Bearish sentiment to trigger SELL
-        sentiment = {"sentiment_score": -0.7, "article_count": 2,
-                     "source_breakdown": {"marketaux": 1, "newsapi": 1}, "confidence": 0.5,
-                     "individual_scores": [-0.7, -0.7]}
-        market = self._market(price_change_pct=0.1)
+    def test_drift_enrichment_boosts(self):
+        """News catalyst drift should be boosted when sentiment enrichment is provided."""
+        market = self._market(price=105.0, prev_close=100.0, day_high=105.5, day_low=100.0)
+        plain = news_catalyst_drift("AAPL", market)
+        boosted = news_catalyst_drift("AAPL", market, self._sentiment(
+            urgency="breaking", materiality="high", time_horizon="intraday",
+        ))
+        self.assertEqual(plain["signal"], "BUY")
+        self.assertEqual(boosted["signal"], "BUY")
+        self.assertGreater(boosted["confidence"], plain["confidence"])
 
-        risk_off_signals = run_all_strategies(
-            "AAPL", market, sentiment, regime_data={"regime": "risk_off"}
-        )
+    def test_drift_no_sentiment_unchanged(self):
+        """news_catalyst_drift without sentiment_data should behave as before."""
+        market = self._market(price=105.0, prev_close=100.0, day_high=105.5, day_low=100.0)
+        without = news_catalyst_drift("AAPL", market)
+        with_none = news_catalyst_drift("AAPL", market, None)
+        self.assertEqual(without["confidence"], with_none["confidence"])
 
-        sell_signals = [s for s in risk_off_signals if s["signal"] == "SELL"]
-        self.assertGreater(len(sell_signals), 0)
+    def test_enrichment_reason_tag(self):
+        """Enrichment factors should appear in the reason string."""
+        result = sentiment_price_divergence("AAPL", self._market(), self._sentiment(
+            urgency="breaking", materiality="high", time_horizon="intraday",
+        ))
+        self.assertIn("urgency=breaking", result["reason"])
+        self.assertIn("materiality=high", result["reason"])
+        self.assertIn("time_horizon=intraday", result["reason"])
 
-    def test_risk_off_boosts_mean_reversion(self, _):
-        """Risk-off should double mean reversion confidence."""
-        market = self._market(rsi=25, price_change_pct=1.0)
+    def test_confidence_still_clamped_after_boost(self):
+        """Even with max enrichment boost, confidence stays <= 0.95."""
+        # Very strong sentiment + enrichment
+        result = sentiment_price_divergence("AAPL", self._market(), self._sentiment(
+            sentiment_score=0.95, article_count=5,
+            source_breakdown={"newsapi": 3, "marketaux": 2},
+            individual_scores=[0.95, 0.95, 0.95, 0.95, 0.95],
+            urgency="breaking", materiality="high", time_horizon="intraday",
+        ))
+        self.assertLessEqual(result["confidence"], 0.95)
 
-        neutral_signals = run_all_strategies("AAPL", market, regime_data={"regime": "neutral"})
-        risk_off_signals = run_all_strategies("AAPL", market, regime_data={"regime": "risk_off"})
-
-        mr_neutral = next(s for s in neutral_signals if s["strategy"] == "mean_reversion")
-        mr_risk_off = next(s for s in risk_off_signals if s["strategy"] == "mean_reversion")
-
-        self.assertGreater(mr_risk_off["confidence"], mr_neutral["confidence"])
-
-    def test_risk_off_volume_confirmation_stronger(self, _):
-        """Risk-off should make volume confirmation 2x stronger."""
-        sentiment = {"sentiment_score": -0.55, "article_count": 2,
-                     "source_breakdown": {"marketaux": 1, "newsapi": 1}, "confidence": 0.5,
-                     "individual_scores": [-0.55, -0.55]}
-        # Moderate high volume (1.6x) to trigger volume confirmation without capping
-        market = self._market(price_change_pct=0.1, volume=72_000_000)
-
-        neutral_signals = run_all_strategies("AAPL", market, sentiment, regime_data={"regime": "neutral"})
-        risk_off_signals = run_all_strategies("AAPL", market, sentiment, regime_data={"regime": "risk_off"})
-
-        div_neutral = next(s for s in neutral_signals if s["strategy"] == "sentiment_divergence")
-        div_risk_off = next(s for s in risk_off_signals if s["strategy"] == "sentiment_divergence")
-
-        # Risk-off with 2x volume weight should boost the high-volume SELL more
-        self.assertGreater(div_risk_off["confidence"], div_neutral["confidence"])
-
-    def test_neutral_regime_no_adjustment(self, _):
-        """Neutral regime should not modify strategy weights."""
+    @patch("engine.strategies.get_previous_sentiment")
+    def test_run_all_with_enrichment(self, mock_prev):
+        """run_all_strategies should produce higher confidence with enrichment."""
+        mock_prev.return_value = None
         market = self._market()
-        sentiment = self._sentiment()
+        plain_sent = self._sentiment()
+        enriched_sent = self._sentiment(urgency="breaking", materiality="high", time_horizon="intraday")
 
-        signals_none = run_all_strategies("AAPL", market, sentiment)
-        signals_neutral = run_all_strategies("AAPL", market, sentiment, regime_data={"regime": "neutral"})
+        plain_result = run_all_strategies("AAPL", market, plain_sent)
+        enriched_result = run_all_strategies("AAPL", market, enriched_sent)
 
-        # With no regime vs neutral regime, confidences should match
-        for s_none, s_neutral in zip(
-            sorted(signals_none, key=lambda x: x["strategy"]),
-            sorted(signals_neutral, key=lambda x: x["strategy"]),
-        ):
-            self.assertAlmostEqual(s_none["confidence"], s_neutral["confidence"], places=3)
+        # Both should return signals/modifiers dict
+        self.assertIn("signals", plain_result)
+        self.assertIn("signals", enriched_result)
+        self.assertTrue(len(plain_result["signals"]) > 0)
+        self.assertTrue(len(enriched_result["signals"]) > 0)
 
-    def test_confidence_clamped_with_regime_boost(self, _):
-        """Even with regime boosting, confidence must stay in [0.05, 0.95]."""
-        sentiment = {"sentiment_score": 0.95, "article_count": 5,
-                     "source_breakdown": {"a": 2, "b": 3}, "confidence": 0.8,
-                     "individual_scores": [0.9, 0.95, 0.92, 0.93, 0.91]}
-        market = self._market(volume=200_000_000, vwap=160)
-        regime = {"regime": "risk_on"}
+        # Find matching strategy to compare
+        plain_div = next((s for s in plain_result["signals"] if s["strategy"] == "sentiment_divergence"), None)
+        enriched_div = next((s for s in enriched_result["signals"] if s["strategy"] == "sentiment_divergence"), None)
 
-        signals = run_all_strategies("AAPL", market, sentiment, regime_data=regime)
-
-        for s in signals:
-            self.assertLessEqual(s["confidence"], 0.95)
-            self.assertGreaterEqual(s["confidence"], 0.05)
+        if plain_div and enriched_div:
+            self.assertGreater(enriched_div["confidence"], plain_div["confidence"])
 
 
 if __name__ == "__main__":
