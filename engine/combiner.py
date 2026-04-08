@@ -31,11 +31,11 @@ from typing import Dict, List, Any, Optional
 logger = logging.getLogger(__name__)
 
 # Signal decision thresholds
-BUY_THRESHOLD = 0.55
-SELL_THRESHOLD = 0.55  # symmetric: any signal below this becomes HOLD
+BUY_THRESHOLD = 0.45
+SELL_THRESHOLD = 0.45  # symmetric: any signal below this becomes HOLD
 
 # Default learned weight for strategies not yet in the DB
-DEFAULT_WEIGHT = 0.5
+DEFAULT_WEIGHT = 1.0
 
 # Strategy categorization
 _CAT1_STRATEGIES = {"sentiment_divergence", "multi_source_consensus", "sentiment_momentum"}
@@ -44,8 +44,8 @@ _STANDALONE_STRATEGIES = {"momentum", "mean_reversion"}
 
 # Regime filter constants
 _RISK_ON_SELL_DAMPEN = 0.8    # SELL confidence *= 0.8 in risk-on
-_RISK_OFF_BUY_DAMPEN = 0.7    # BUY confidence *= 0.7 in risk-off
-_RISK_OFF_BUY_GATE = 0.8      # kill BUY if confidence < 0.8 after dampening
+_RISK_OFF_BUY_DAMPEN = 0.85   # BUY confidence *= 0.85 in risk-off
+_RISK_OFF_BUY_GATE = 0.45     # kill BUY if confidence < 0.45 after dampening
 
 # Cat 3 integration weights
 _CAT3_CONFIRM_WEIGHT = 0.2    # boost when drift confirms direction

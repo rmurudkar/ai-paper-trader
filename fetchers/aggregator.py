@@ -9,6 +9,26 @@ Step 4: use snippet only                 → mark partial:true, flag for limited
 Then merge all sources: Marketaux + NewsAPI (enriched) + Polygon feed + Alpaca News
 Deduplicate: exact URL match first, then title similarity > 80%
 Sort by published_at descending
+
+
+After fetch_all_news() returns, you get a single list with ~70-80 articles, structured like this:
+ [
+      {
+          "title": "Semiconductor Tariff Could Impact Tech Giants",
+          "full_text": "Full article text (1200 words max)...",  # if available
+          "snippet": "Short excerpt...",  # if no full_text
+          "url": "https://example.com/article",
+          "published_at": "2026-04-07T13:00:00Z",
+          "source": "newsapi",  # or: marketaux, alpaca, massive, polygon
+          "tickers": ["AAPL", "NVDA"],
+          "sentiment_score": 0.65,  # marketaux/massive only
+          "topics": ["geopolitical"],  # newsapi only
+          "extraction_confidence": 0.85,  # newsapi only
+          "partial": False,  # True if snippet-only
+          "author": "John Doe",  # alpaca/massive only
+      },
+      # ... 70+ more articles, sorted by published_at DESC
+  ]
 """
 
 import logging
@@ -257,25 +277,30 @@ def waterfall_enrich_newsapi(
     enriched = list(newsapi_articles)
 
     # Step 1: Polygon full text lookup
+    logger.info(f"[WATERFALL] Step 1 START: Enriching with Polygon ({len(enriched)} articles need full_text)")
     enriched = enrich_newsapi_with_polygon(enriched)
     remaining = sum(1 for a in enriched if a.get('needs_full_text'))
-    logger.info(f"After Polygon enrichment: {remaining} articles still need full text")
+    logger.info(f"[WATERFALL] Step 1 DONE: Polygon enriched {len(enriched) - remaining} articles, {remaining} still need full_text")
 
     # Step 2: Alpaca News title matching
+    logger.info(f"[WATERFALL] Step 2 START: Enriching with Alpaca ({remaining} articles need full_text)")
     enriched = enrich_newsapi_with_alpaca(enriched, alpaca_articles or [])
     remaining = sum(1 for a in enriched if a.get('needs_full_text'))
-    logger.info(f"After Alpaca enrichment: {remaining} articles still need full text")
+    logger.info(f"[WATERFALL] Step 2 DONE: Alpaca enriched articles, {remaining} still need full_text")
 
     # Step 3: Scraper fallback
+    logger.info(f"[WATERFALL] Step 3 START: Scraping URLs ({remaining} articles need full_text)")
     enriched = enrich_newsapi_with_scraper(enriched)
     remaining = sum(1 for a in enriched if a.get('needs_full_text'))
-    logger.info(f"After scraper enrichment: {remaining} articles remain snippet-only")
+    logger.info(f"[WATERFALL] Step 3 DONE: Scraper enriched articles, {remaining} remain snippet-only")
 
     # Step 4: Mark any remaining as partial
+    logger.info(f"[WATERFALL] Step 4 START: Marking {remaining} articles as partial")
     for article in enriched:
         if article.get('needs_full_text'):
             article['partial'] = True
             article.pop('needs_full_text', None)
+    logger.info(f"[WATERFALL] Step 4 DONE: All articles processed")
 
     return enriched
 
@@ -290,18 +315,26 @@ def enrich_newsapi_with_polygon(newsapi_articles: List[Dict]) -> List[Dict]:
         Articles with full_text added where Polygon lookup succeeded.
     """
     enriched = []
-    for article in newsapi_articles:
+    total = len(newsapi_articles)
+
+    for idx, article in enumerate(newsapi_articles):
         if not article.get('needs_full_text'):
             enriched.append(article)
             continue
 
         url = article.get('url', '')
+        title = article.get('title', '')[:60]
+
         if not url:
             enriched.append(article)
             continue
 
+        logger.info(f"[POLYGON] Processing article {idx+1}/{total}: {title}... (url={url})")
+
         try:
+            logger.debug(f"[POLYGON] Calling fetch_full_text() for: {url}")
             result = polygon.fetch_full_text(url)
+
             if result and result.get('full_text'):
                 updated = article.copy()
                 updated['full_text'] = result['full_text']
@@ -312,10 +345,12 @@ def enrich_newsapi_with_polygon(newsapi_articles: List[Dict]) -> List[Dict]:
                 existing_tickers.update(result.get('tickers', []))
                 updated['tickers'] = list(existing_tickers)
                 enriched.append(updated)
-                logger.debug(f"Polygon enriched: {article.get('title', '')[:60]}")
+                logger.info(f"[POLYGON] ✓ Enriched article {idx+1}/{total}: {title}")
                 continue
+            else:
+                logger.debug(f"[POLYGON] No result from fetch_full_text for: {url}")
         except Exception as e:
-            logger.warning(f"Polygon enrichment failed for {url}: {e}")
+            logger.error(f"[POLYGON] Exception for article {idx+1}/{total} ({url}): {e}")
 
         enriched.append(article)
 
@@ -390,29 +425,45 @@ def enrich_newsapi_with_scraper(newsapi_articles: List[Dict]) -> List[Dict]:
         Articles with scraped full_text or unchanged if scraping fails.
     """
     enriched = []
+    total = len([a for a in newsapi_articles if a.get('needs_full_text')])
+
+    if total == 0:
+        return newsapi_articles
+
+    idx_count = 0
     for article in newsapi_articles:
         if not article.get('needs_full_text'):
             enriched.append(article)
             continue
 
+        idx_count += 1
         url = article.get('url', '')
+        title = article.get('title', '')[:60]
         snippet = article.get('snippet', '')
+
         if not url:
+            logger.debug(f"[SCRAPER] Skipping article {idx_count}/{total} — no URL")
             enriched.append(article)
             continue
 
+        logger.info(f"[SCRAPER] Processing article {idx_count}/{total}: {title}... (url={url})")
+
         try:
+            logger.debug(f"[SCRAPER] Calling scrape() for: {url}")
             result = scraper.scrape(url, snippet=snippet)
+
             if result and result.get('full_text') and not result.get('partial', True):
                 updated = article.copy()
                 updated['full_text'] = result['full_text']
                 updated['partial'] = False
                 updated.pop('needs_full_text', None)
                 enriched.append(updated)
-                logger.debug(f"Scraper enriched: {article.get('title', '')[:60]}")
+                logger.info(f"[SCRAPER] ✓ Enriched article {idx_count}/{total}: {title}")
                 continue
+            else:
+                logger.debug(f"[SCRAPER] Scrape returned partial or empty for {url}")
         except Exception as e:
-            logger.warning(f"Scraper enrichment failed for {url}: {e}")
+            logger.error(f"[SCRAPER] Exception for article {idx_count}/{total} ({url}): {e}")
 
         enriched.append(article)
 

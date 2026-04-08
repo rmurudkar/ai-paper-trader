@@ -21,12 +21,21 @@ _MIN_REQUEST_INTERVAL = 13.0
 _last_request_time: float = 0.0
 
 
+# Module-level cache for Polygon articles within a single trading cycle
+_polygon_cache: List[Dict] = []
+_polygon_cache_timestamp: float = 0.0
+_POLYGON_CACHE_TTL = 300.0  # 5 minutes — re-fetch if older
+
+
 def fetch_full_text(url: str) -> Optional[Dict]:
     """Fetch full licensed article text from Polygon.io by URL lookup.
 
     Step 1 of waterfall enrichment for NewsAPI.ai articles.
     Uses Polygon API endpoint: GET https://api.polygon.io/v2/reference/news
     Truncates article body to 1200 words max.
+
+    OPTIMIZATION: Caches Polygon results per trading cycle to avoid N API calls
+    for N articles. Cache invalidates after 5 minutes.
 
     Args:
         url: Article URL to match against Polygon articles.
@@ -40,17 +49,47 @@ def fetch_full_text(url: str) -> Optional[Dict]:
 
     api_key = os.getenv('POLYGON_API_TOKEN')
     if not api_key:
-        logger.error("POLYGON_API_TOKEN not found in environment variables")
+        logger.debug("POLYGON_API_TOKEN not set — skipping Polygon enrichment")
         return None
 
-    # Fetch recent articles across watchlist tickers and search by URL
-    candidates = _fetch_general_news(DEFAULT_WATCHLIST, max_results=50)
+    # Fetch recent articles across watchlist tickers and search by URL (with caching)
+    candidates = _get_cached_polygon_articles()
 
     for article in candidates:
         if article.get('url') == url:
+            logger.debug(f"[POLYGON] Cache hit for: {url}")
             return article
 
+    logger.debug(f"[POLYGON] Cache miss for: {url}")
     return None
+
+
+def _get_cached_polygon_articles(max_results: int = 50) -> List[Dict]:
+    """Get cached Polygon articles, fetching only if cache is stale.
+
+    Args:
+        max_results: Max articles to fetch if cache is invalid.
+
+    Returns:
+        List of article dicts from Polygon cache.
+    """
+    global _polygon_cache, _polygon_cache_timestamp
+
+    current_time = time.time()
+    cache_age = current_time - _polygon_cache_timestamp
+
+    # If cache is fresh, return it
+    if _polygon_cache and cache_age < _POLYGON_CACHE_TTL:
+        logger.debug(f"[POLYGON] Using cached articles ({len(_polygon_cache)} articles, age={cache_age:.1f}s)")
+        return _polygon_cache
+
+    # Cache is stale or empty — fetch fresh
+    logger.info(f"[POLYGON] Cache miss or stale (age={cache_age:.1f}s) — fetching fresh articles")
+    _polygon_cache = _fetch_general_news(DEFAULT_WATCHLIST, max_results=max_results)
+    _polygon_cache_timestamp = time.time()
+
+    logger.info(f"[POLYGON] Fetched {len(_polygon_cache)} articles, cache now valid for 5 minutes")
+    return _polygon_cache
 
 
 def _fetch_ticker_news(ticker: str, max_results: int = 10) -> List[Dict]:

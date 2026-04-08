@@ -109,8 +109,13 @@ def check_trade(
             f"Micro-cap: {ticker} market cap ${market_cap/1e9:.2f}B < ${MIN_MARKET_CAP/1e9:.0f}B minimum"
         )
 
-    # ── 3. Max open positions ───────────────────────────────────────────
+    # ── 3. Max open positions + no-short-selling guard ─────────────────
     existing_position = _find_position(ticker, positions)
+
+    # Never short-sell: SELL is only valid if we already hold the position
+    if direction == "SELL" and existing_position is None:
+        return _reject(f"No position in {ticker} — short selling not permitted")
+
     if existing_position is None and len(positions) >= MAX_OPEN_POSITIONS:
         return _reject(f"Max open positions reached ({MAX_OPEN_POSITIONS})")
 

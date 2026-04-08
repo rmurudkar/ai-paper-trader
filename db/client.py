@@ -20,18 +20,70 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+_db_client: Optional[libsql_client.Client] = None
+_db_init_error: Optional[Exception] = None
+
 
 def get_db() -> libsql_client.Client:
-    """Get or create Turso database connection."""
+    """Get the shared Turso database client (singleton).
+
+    On first call, creates the client. On failure, caches the error and
+    re-raises it on all subsequent calls — prevents leaking event loops
+    from repeated failed create_client_sync() calls.
+    """
+    global _db_client, _db_init_error
+
+    if _db_client is not None:
+        return _db_client
+
+    if _db_init_error is not None:
+        raise _db_init_error
+
     url = os.getenv("TURSO_CONNECTION_URL")
     auth_token = os.getenv("TURSO_AUTH_TOKEN")
 
     if not url or not auth_token:
-        raise ValueError(
+        _db_init_error = ValueError(
             "TURSO_CONNECTION_URL and TURSO_AUTH_TOKEN must be set in .env"
         )
+        logger.error(f"[DB] {_db_init_error}")
+        raise _db_init_error
 
-    return libsql_client.create_client_sync(url=url, auth_token=auth_token)
+    logger.debug(f"[DB] Creating connection to {url}")
+    try:
+        _db_client = libsql_client.create_client_sync(url=url, auth_token=auth_token)
+        logger.debug(f"[DB] Connection created successfully, type={type(_db_client)}")
+        return _db_client
+    except Exception as e:
+        logger.error(f"[DB] Failed to create client: {type(e).__name__}: {e}")
+        _db_init_error = e
+        raise
+
+
+def reset_db() -> None:
+    """Reset the singleton so get_db() will retry on next call.
+
+    Use this if you want to recover after a transient network error.
+    """
+    global _db_client, _db_init_error
+    if _db_client is not None:
+        try:
+            _db_client.close()
+        except Exception:
+            pass
+    _db_client = None
+    _db_init_error = None
+
+
+def close_db() -> None:
+    """Close the shared database client. Call on app shutdown."""
+    global _db_client
+    if _db_client is not None:
+        try:
+            _db_client.close()
+        except Exception:
+            pass
+        _db_client = None
 
 
 @contextmanager
@@ -455,14 +507,22 @@ def save_sentiment_score(ticker: str, sentiment_score: float, article_count: int
     The sentiment_momentum strategy compares the latest score against the
     previous cycle's score to detect narrative shifts.
     """
-    db = get_db()
-    now = datetime.utcnow().isoformat() + "Z"
-    db.execute(
-        "INSERT INTO sentiment_history (ticker, sentiment_score, article_count, recorded_at) "
-        "VALUES (?, ?, ?, ?)",
-        [ticker, sentiment_score, article_count, now],
-    )
-    logger.debug(f"Saved sentiment for {ticker}: {sentiment_score} ({article_count} articles)")
+    logger.debug(f"[DB] save_sentiment_score called: ticker={ticker}, score={sentiment_score}, articles={article_count}")
+    try:
+        db = get_db()
+        logger.debug(f"[DB] Got database connection for {ticker}")
+        now = datetime.utcnow().isoformat() + "Z"
+        logger.debug(f"[DB] Executing INSERT for {ticker}: timestamp={now}")
+        result = db.execute(
+            "INSERT INTO sentiment_history (ticker, sentiment_score, article_count, recorded_at) "
+            "VALUES (?, ?, ?, ?)",
+            [ticker, sentiment_score, article_count, now],
+        )
+        logger.debug(f"[DB] INSERT executed for {ticker}, result type={type(result)}")
+        logger.debug(f"Saved sentiment for {ticker}: {sentiment_score} ({article_count} articles)")
+    except Exception as e:
+        logger.error(f"[DB] save_sentiment_score exception for {ticker}: {type(e).__name__}: {e}")
+        raise
 
 
 def get_previous_sentiment(ticker: str) -> Optional[Dict[str, Any]]:
@@ -474,23 +534,34 @@ def get_previous_sentiment(ticker: str) -> Optional[Dict[str, Any]]:
     Returns:
         Dict with sentiment_score, article_count, recorded_at — or None.
     """
-    db = get_db()
-    result = db.execute(
-        "SELECT sentiment_score, article_count, recorded_at "
-        "FROM sentiment_history "
-        "WHERE ticker = ? "
-        "ORDER BY recorded_at DESC "
-        "LIMIT 1 OFFSET 1",
-        [ticker],
-    )
-    if result.rows:
-        row = result.rows[0]
-        return {
-            "sentiment_score": row[0],
-            "article_count": row[1],
-            "recorded_at": row[2],
-        }
-    return None
+    logger.debug(f"[DB] get_previous_sentiment called for {ticker}")
+    try:
+        db = get_db()
+        logger.debug(f"[DB] Got database connection for {ticker}")
+        logger.debug(f"[DB] Executing SELECT for {ticker}")
+        result = db.execute(
+            "SELECT sentiment_score, article_count, recorded_at "
+            "FROM sentiment_history "
+            "WHERE ticker = ? "
+            "ORDER BY recorded_at DESC "
+            "LIMIT 1 OFFSET 1",
+            [ticker],
+        )
+        logger.debug(f"[DB] SELECT executed for {ticker}, result type={type(result)}, has .rows={hasattr(result, 'rows')}")
+        if result.rows:
+            logger.debug(f"[DB] Found {len(result.rows)} rows for {ticker}")
+            row = result.rows[0]
+            logger.debug(f"[DB] Row data for {ticker}: {row}")
+            return {
+                "sentiment_score": row[0],
+                "article_count": row[1],
+                "recorded_at": row[2],
+            }
+        logger.debug(f"[DB] No rows found for {ticker}")
+        return None
+    except Exception as e:
+        logger.error(f"[DB] get_previous_sentiment exception for {ticker}: {type(e).__name__}: {e}")
+        raise
 
 
 # ============================================================================
