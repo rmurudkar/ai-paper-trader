@@ -66,6 +66,14 @@ CREATE TABLE IF NOT EXISTS sentiment_history (
 CREATE INDEX IF NOT EXISTS idx_sentiment_history_ticker_time
     ON sentiment_history (ticker, recorded_at DESC);
 
+CREATE TABLE IF NOT EXISTS seen_articles (
+    url TEXT PRIMARY KEY,
+    seen_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_seen_articles_seen_at
+    ON seen_articles (seen_at);
+
 CREATE TABLE IF NOT EXISTS discovery_log (
     cycle_id TEXT NOT NULL,
     ticker TEXT NOT NULL,

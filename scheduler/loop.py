@@ -166,6 +166,20 @@ def run_trading_cycle(is_premarket: bool = False) -> Dict[str, Any]:
         # Continue — we can still run technical strategies without news
     phase_timings["news_fetch"] = int((time.monotonic() - t0) * 1000)
 
+    # ── 4b. Deduplicate articles seen in previous cycles ───────────────
+    if articles:
+        try:
+            from db.client import filter_unseen_articles, mark_articles_seen, cleanup_seen_articles
+            unseen = filter_unseen_articles(articles, ttl_hours=8)
+            skipped = len(articles) - len(unseen)
+            if skipped:
+                logger.info(f"Cycle {cycle_id}: Skipping {skipped} already-seen articles, {len(unseen)} new")
+            mark_articles_seen(unseen)
+            cleanup_seen_articles(max_age_hours=24)
+            articles = unseen
+        except Exception as e:
+            logger.warning(f"Cycle {cycle_id}: Article dedup failed, processing all articles: {e}")
+
     # ── 5. Sentiment analysis ──────────────────────────────────────────
     t0 = time.monotonic()
     sentiment_results = []

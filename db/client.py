@@ -565,6 +565,98 @@ def get_previous_sentiment(ticker: str) -> Optional[Dict[str, Any]]:
 
 
 # ============================================================================
+# SEEN ARTICLES DEDUPLICATION
+# ============================================================================
+
+
+def filter_unseen_articles(articles: List[Dict], ttl_hours: int = 8) -> List[Dict]:
+    """Return only articles whose URLs haven't been seen within ttl_hours.
+
+    Articles without a URL are always passed through. Seen URLs are looked up
+    in bulk so this is one DB round-trip regardless of article count.
+
+    Args:
+        articles: Article dicts from the aggregator.
+        ttl_hours: How long a URL is considered "seen". Default 8h covers a
+                   full trading session so articles aren't re-analyzed intra-day,
+                   but fresh articles appear the next morning.
+
+    Returns:
+        Subset of articles not yet seen.
+    """
+    if not articles:
+        return []
+
+    try:
+        db = get_db()
+        result = db.execute(
+            "SELECT url FROM seen_articles "
+            "WHERE seen_at >= datetime('now', ? || ' hours')",
+            [f"-{ttl_hours}"],
+        )
+        seen_urls = {row[0] for row in result.rows}
+    except Exception as e:
+        logger.warning(f"Could not read seen_articles, processing all articles: {e}")
+        return articles
+
+    unseen = [a for a in articles if not a.get("url") or a["url"] not in seen_urls]
+    logger.debug(f"seen_articles filter: {len(articles)} total, {len(articles) - len(unseen)} skipped, {len(unseen)} new")
+    return unseen
+
+
+def mark_articles_seen(articles: List[Dict]) -> None:
+    """Record article URLs as seen so future cycles skip them.
+
+    Uses INSERT OR IGNORE so re-marking an already-seen URL is a no-op
+    (the original seen_at timestamp is preserved).
+
+    Args:
+        articles: Article dicts to mark. Articles without a URL are skipped.
+    """
+    if not articles:
+        return
+
+    db = get_db()
+    now = datetime.utcnow().isoformat() + "Z"
+    marked = 0
+    for article in articles:
+        url = article.get("url")
+        if url:
+            try:
+                db.execute(
+                    "INSERT OR IGNORE INTO seen_articles (url, seen_at) VALUES (?, ?)",
+                    [url, now],
+                )
+                marked += 1
+            except Exception as e:
+                logger.debug(f"Could not mark article seen ({url}): {e}")
+
+    logger.debug(f"Marked {marked} articles as seen")
+
+
+def cleanup_seen_articles(max_age_hours: int = 24) -> int:
+    """Delete seen_articles rows older than max_age_hours.
+
+    Called once per cycle to keep the table from growing unbounded.
+
+    Returns:
+        Number of rows deleted.
+    """
+    try:
+        db = get_db()
+        db.execute(
+            "DELETE FROM seen_articles WHERE seen_at < datetime('now', ? || ' hours')",
+            [f"-{max_age_hours}"],
+        )
+        # libsql_client doesn't expose rowcount; log without it
+        logger.debug(f"Cleaned up seen_articles older than {max_age_hours}h")
+        return 0
+    except Exception as e:
+        logger.warning(f"Could not clean up seen_articles: {e}")
+        return 0
+
+
+# ============================================================================
 # DISCOVERY LOG UTILITIES
 # ============================================================================
 
