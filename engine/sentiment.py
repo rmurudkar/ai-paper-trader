@@ -152,6 +152,7 @@ import os
 import json
 import anthropic
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import List, Dict
 
@@ -327,23 +328,32 @@ def analyze_article_sentiment(article: Dict) -> List[Dict]:
                 r.setdefault('published_at', published_at)
             return sector_results
 
-        # Analyze sentiment for each ticker mentioned in the article
-        for ticker in tickers:
-            try:
-                claude_result = analyze_newsapi_with_claude(full_text, ticker)
-                if claude_result:
-                    results.append({
-                        'ticker': ticker,
-                        'sentiment_score': claude_result.get('sentiment_score', 0.0),
-                        'source': source,
-                        'reasoning': claude_result.get('reasoning', 'Claude analysis'),
-                        'urgency': claude_result.get('urgency', 'standard'),
-                        'materiality': claude_result.get('materiality', 'unknown'),
-                        'time_horizon': claude_result.get('time_horizon', 'medium_term'),
-                        'published_at': published_at,
-                    })
-            except Exception as e:
-                logger.error(f"Claude sentiment analysis failed for {ticker} in {source} article: {e}")
+        # Analyze sentiment for each ticker in parallel
+        def _analyze_ticker(tkr):
+            result = analyze_newsapi_with_claude(full_text, tkr)
+            if result:
+                return {
+                    'ticker': tkr,
+                    'sentiment_score': result.get('sentiment_score', 0.0),
+                    'source': source,
+                    'reasoning': result.get('reasoning', 'Claude analysis'),
+                    'urgency': result.get('urgency', 'standard'),
+                    'materiality': result.get('materiality', 'unknown'),
+                    'time_horizon': result.get('time_horizon', 'medium_term'),
+                    'published_at': published_at,
+                }
+            return None
+
+        with ThreadPoolExecutor(max_workers=len(tickers)) as ticker_pool:
+            futures = {ticker_pool.submit(_analyze_ticker, t): t for t in tickers}
+            for fut in as_completed(futures):
+                tkr = futures[fut]
+                try:
+                    r = fut.result()
+                    if r:
+                        results.append(r)
+                except Exception as e:
+                    logger.error(f"Claude sentiment analysis failed for {tkr} in {source} article: {e}")
 
     else:
         logger.warning(f"Unknown source '{source}' for sentiment analysis")
@@ -417,15 +427,14 @@ Article text:
             model="claude-haiku-4-5-20251001",
             max_tokens=600,
             temperature=0.1,
-            messages=[{"role": "user", "content": prompt}]
+            system="You are a macro-aware equity trader. Always respond with a single valid JSON object and nothing else. No prose, no markdown, no code fences.",
+            messages=[
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "{"},
+            ]
         )
 
-        response_text = response.content[0].text.strip()
-        if response_text.startswith("```"):
-            lines = response_text.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            response_text = "\n".join(lines).strip()
-
+        response_text = "{" + response.content[0].text.strip()
         data = json.loads(response_text)
         urgency = data.get('urgency', 'standard')
         materiality = data.get('materiality', 'unknown')
@@ -501,27 +510,22 @@ def analyze_newsapi_with_claude(full_text: str, ticker: str) -> Dict:
 
     prompt = f"""Analyze this financial news article as it relates to stock ticker {ticker}.
 
-Return a JSON object with exactly these fields:
-
-1. "sentiment_score": float from -1.0 (very bearish) to 1.0 (very bullish), 0.0 = neutral
-
-2. "urgency": how time-sensitive is this news?
-   - "breaking": just happened, market is reacting now (earnings surprise, FDA decision, CEO resignation)
-   - "developing": unfolding over hours, still evolving (regulatory investigation, deal negotiations)
-   - "standard": background/thematic piece, no immediate catalyst (industry trends, analyst commentary)
-
-3. "materiality": how much does this affect the company's fundamentals?
-   - "high": directly impacts revenue, earnings, or valuation (earnings miss, major contract win/loss, guidance change, lawsuit with material damages)
-   - "medium": affects operations or market position but not immediately quantifiable (management change, product launch, partnership)
-   - "low": minimal fundamental impact (minor executive hire, conference attendance, generic industry commentary)
-
-4. "time_horizon": how long will this news drive price action?
-   - "intraday": one-day catalyst, price impact exhausts within the session
-   - "short_term": 1-5 day catalyst (earnings reaction, product launch)
-   - "medium_term": 1-4 week theme (regulatory process, sector rotation)
-   - "long_term": multi-month structural change (new market entry, fundamental business pivot)
-
-5. "reasoning": one sentence explaining your assessment
+Fields to populate:
+- "sentiment_score": float -1.0 (very bearish) to 1.0 (very bullish), 0.0 = neutral
+- "urgency": exactly one of "breaking" | "developing" | "standard"
+  - breaking: just happened, market reacting now (earnings surprise, FDA decision, CEO resignation)
+  - developing: unfolding over hours (regulatory investigation, deal negotiations)
+  - standard: background/thematic, no immediate catalyst
+- "materiality": exactly one of "high" | "medium" | "low"
+  - high: directly impacts revenue, earnings, or valuation (earnings miss, contract win/loss, guidance change)
+  - medium: affects operations but not immediately quantifiable (management change, product launch, partnership)
+  - low: minimal fundamental impact (minor hire, conference, generic commentary)
+- "time_horizon": exactly one of "intraday" | "short_term" | "medium_term" | "long_term"
+  - intraday: price impact exhausts within the session
+  - short_term: 1-5 days (earnings reaction, product launch)
+  - medium_term: 1-4 weeks (regulatory process, sector rotation)
+  - long_term: multi-month structural change
+- "reasoning": one sentence
 
 Article text:
 {truncated_text}"""
@@ -531,19 +535,15 @@ Article text:
             model="claude-haiku-4-5-20251001",
             max_tokens=400,
             temperature=0.1,
-            messages=[{
-                "role": "user",
-                "content": prompt
-            }]
+            system="You are a financial news sentiment analyzer. Always respond with a single valid JSON object and nothing else. No prose, no markdown, no code fences.",
+            messages=[
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "{"},
+            ]
         )
 
-        response_text = response.content[0].text.strip()
-
-        # Strip markdown code fences if present
-        if response_text.startswith("```"):
-            lines = response_text.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            response_text = "\n".join(lines).strip()
+        # Prepend the prefilled "{" since Claude continues from it
+        response_text = "{" + response.content[0].text.strip()
 
         try:
             result = json.loads(response_text)
@@ -715,11 +715,16 @@ def _fallback_parse(response_text: str) -> Dict:
     }
 
 
-def batch_analyze_articles(articles: List[Dict]) -> List[Dict]:
-    """Run sentiment analysis for multiple articles.
+_ARTICLE_WORKERS = 15  # concurrent articles; tune down if hitting Haiku rate limits
 
-    Processes both Marketaux/Massive (direct sentiment passthrough) and
-    NewsAPI (Claude analysis of full_text) articles.
+
+def batch_analyze_articles(articles: List[Dict]) -> List[Dict]:
+    """Run sentiment analysis for multiple articles in parallel.
+
+    Articles are processed concurrently (up to _ARTICLE_WORKERS threads).
+    Within each newsapi/alpaca/polygon article, per-ticker Claude calls are
+    also parallelized. Marketaux/Massive ticker loops are short enough that
+    article-level parallelism covers them.
 
     Args:
         articles: List of article dicts from aggregator.
@@ -728,13 +733,16 @@ def batch_analyze_articles(articles: List[Dict]) -> List[Dict]:
         List of sentiment analysis results per ticker per article.
     """
     all_results = []
+    workers = min(_ARTICLE_WORKERS, len(articles)) if articles else 1
 
-    for article in articles:
-        try:
-            article_results = analyze_article_sentiment(article)
-            all_results.extend(article_results)
-        except Exception as e:
-            logger.error(f"Failed to analyze sentiment for article {article.get('title', 'Unknown')}: {e}")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(analyze_article_sentiment, a): a for a in articles}
+        for fut in as_completed(futures):
+            article = futures[fut]
+            try:
+                all_results.extend(fut.result())
+            except Exception as e:
+                logger.error(f"Failed to analyze sentiment for article {article.get('title', 'Unknown')}: {e}")
 
     logger.info(f"Batch sentiment analysis complete: {len(articles)} articles → {len(all_results)} ticker sentiments")
     return all_results

@@ -174,6 +174,22 @@ def run_trading_cycle(is_premarket: bool = False) -> Dict[str, Any]:
         from engine.sentiment import batch_analyze_articles, batch_record_sentiments
         if articles:
             sentiment_results = batch_analyze_articles(articles)
+
+            # Promote tickers inferred by sector/macro Claude analysis that
+            # weren't found by discovery (e.g. oil crash → DAL, UAL).
+            # Must happen before market data fetch so they get price data too.
+            sector_additions = _collect_sector_macro_tickers(
+                sentiment_results, tickers, cycle_id
+            )
+            if sector_additions:
+                tickers = tickers + sector_additions
+                sources.update({t: ["sector_macro"] for t in sector_additions})
+                result["tickers_discovered"] = len(tickers)
+                logger.info(
+                    f"Cycle {cycle_id}: Promoted {len(sector_additions)} sector_macro tickers "
+                    f"into active set: {sector_additions}"
+                )
+
             ticker_sentiments = batch_record_sentiments(tickers, sentiment_results)
             logger.info(
                 f"Cycle {cycle_id}: Sentiment analysis produced "
@@ -186,6 +202,7 @@ def run_trading_cycle(is_premarket: bool = False) -> Dict[str, Any]:
     phase_timings["sentiment"] = int((time.monotonic() - t0) * 1000)
 
     # ── 6. Market data ─────────────────────────────────────────────────
+    # tickers may have grown via sector_macro — fetch covers all of them.
     t0 = time.monotonic()
     market_data: Dict[str, Any] = {"tickers": {}, "macro": {}}
     try:
@@ -412,6 +429,59 @@ def _run_outcome_measurement(context: str, errors: List[str]) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _collect_sector_macro_tickers(
+    sentiment_results: List[Dict],
+    existing_tickers: List[str],
+    cycle_id: str,
+) -> List[str]:
+    """Return validated tickers inferred by sector/macro Claude analysis.
+
+    These come from ticker-less articles where Claude identified second-order
+    trades (e.g. oil crash → buy DAL, UAL). Validates price >= $5,
+    market_cap >= $1B, avg_volume >= 500K before adding to the active set.
+    """
+    import yfinance as yf
+
+    existing = {t.upper() for t in existing_tickers}
+    candidates = {
+        r["ticker"].upper()
+        for r in sentiment_results
+        if r.get("source") == "sector_macro" and r.get("ticker")
+    } - existing
+
+    if not candidates:
+        return []
+
+    logger.info(
+        f"Cycle {cycle_id}: Validating {len(candidates)} sector_macro candidates: "
+        f"{sorted(candidates)}"
+    )
+
+    validated = []
+    for ticker in sorted(candidates):
+        try:
+            info = yf.Ticker(ticker).info
+            price = info.get("currentPrice") or info.get("regularMarketPrice") or 0
+            mkt_cap = info.get("marketCap") or 0
+            avg_vol = info.get("averageVolume") or 0
+
+            if price >= 5 and mkt_cap >= 1_000_000_000 and avg_vol >= 500_000:
+                validated.append(ticker)
+                logger.info(
+                    f"Cycle {cycle_id}: sector_macro {ticker} validated — "
+                    f"price={price:.2f}, mkt_cap={mkt_cap/1e9:.1f}B, vol={avg_vol:,}"
+                )
+            else:
+                logger.debug(
+                    f"Cycle {cycle_id}: sector_macro {ticker} rejected — "
+                    f"price={price}, mkt_cap={mkt_cap}, vol={avg_vol}"
+                )
+        except Exception as e:
+            logger.debug(f"Cycle {cycle_id}: Could not validate sector_macro ticker {ticker}: {e}")
+
+    return validated
+
 
 def _aggregate_macro_sentiment(ticker_sentiments: Dict[str, Dict]) -> float:
     """Average all ticker sentiments as a rough macro sentiment proxy."""
