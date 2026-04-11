@@ -1,6 +1,7 @@
 anthropic
-alpaca-trade-api
-yfinance
+alpaca-trade-api==3.2.0
+yfinance==0.2.40
+websockets==10.4
 requests
 trafilatura
 newspaper3k

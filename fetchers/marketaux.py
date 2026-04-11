@@ -44,6 +44,18 @@ def fetch_news(tickers: List[str] = None, max_results: int = 20, broad: bool = F
     Returns:
         List of dicts with keys: title, ticker, sentiment_score, snippet, url, published_at, source.
         Source field is always "marketaux".
+        [
+            {
+                title,
+                snippet, 
+                description,
+                url,
+                published_at, 
+                source=Marketaux, 
+                groq_extract=True
+            },
+            ...
+        ]
     """
     try:
         # Check rate limits
