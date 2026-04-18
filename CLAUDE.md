@@ -78,10 +78,11 @@ SLACK_WEBHOOK_URL=             # optional
 ```
 
 ## Implementation Status
-- **Complete**: all fetchers, all engine modules, risk/manager.py, executor/alpaca.py,
+- **Complete**: all fetchers, risk/manager.py, executor/alpaca.py,
   all feedback modules, dashboard/app.py, db/client.py, db/schema.sql
 - **Stub**: scheduler/loop.py
-- **Deprecated (delete)**: engine/signals.py — confirm no imports first
+- **Deleted (thesis redesign)**: engine/signals.py, engine/sentiment.py, engine/strategies.py, engine/combiner.py
+- **To implement**: engine/analysis.py, engine/thesis_extractor.py, engine/thesis_lifecycle.py, materiality_classifier.py, new strategies.py, new combiner.py
 
 ## Hard Rules — Never Violate These
 - NEVER send raw headlines to Claude for sentiment — always use `full_text`
@@ -94,7 +95,7 @@ SLACK_WEBHOOK_URL=             # optional
 - NEVER allow total invested >80% of portfolio (keep 20% cash reserve)
 - NEVER trade penny stocks (price < $5) or micro-caps (market cap < $1B)
 - NEVER exceed 30% portfolio allocation in a single sector
-- NEVER import from engine/signals.py — it is deprecated
+- NEVER import deleted modules (signals.py, sentiment.py, old strategies.py, old combiner.py)
 - ALWAYS run discovery.py as the FIRST step in every trading cycle
 - ALWAYS truncate article text to 1200 words before any Claude or Groq call
 - ALWAYS check market hours + circuit breaker before submitting orders
@@ -479,3 +480,267 @@ Key panels:
 - Discovery panel: latest cycle_id, tickers discovered, source per ticker from discovery_log
 - Settings: current env vars, API key status (configured/not set)
 ```
+
+
+
+
+Updated Architecture:
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                         SCHEDULER/LOOP.PY                          │
+│                    (15min cycles, market hours)                     │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         DISCOVERY.PY                               │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐ │
+│  │   News Mentions │  │   Market Movers │  │  Active Theses      │ │
+│  │   (regex/Groq)  │  │   (S&P gainers) │  │  (implied tickers)  │ │
+│  └─────────────────┘  └─────────────────┘  └─────────────────────┘ │
+│             │                   │                   ▲               │
+│             └───────────────────┼───────────────────┘               │
+│                                 ▼                                   │
+│           ┌─────────────────────────────────────────┐               │
+│           │        UNIFIED TICKER LIST              │               │
+│           │     (validated, prioritized, capped)    │               │
+│           └─────────────────────────────────────────┘               │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      NEWS PIPELINE                                  │
+│                                                                     │
+│  marketaux.py  massive.py  newsapi.py  alpaca_news.py  polygon.py  │
+│      │             │           │            │            │         │
+│      └─────────────┼───────────┼────────────┼────────────┘         │
+│                    ▼           ▼            ▼                       │
+│              ┌─────────────────────────────────────┐                │
+│              │         AGGREGATOR.PY               │                │
+│              │   (4-step waterfall + dedup)        │                │
+│              └─────────────────┬───────────────────┘                │
+└──────────────────────────────────┼──────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                  MATERIALITY FILTER (NEW)                          │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │              materiality_classifier.py                         │ │
+│  │                                                                 │ │
+│  │  Stage 1: RULES-BASED HIGH DETECTION                           │ │
+│  │  ┌─────────────────────────────────────────────────────────────┐ │ │
+│  │  │ Keywords: earnings, guidance, CEO, merger, FDA, regulatory  │ │ │
+│  │  │ Multi-ticker: >= 3 tickers → medium                        │ │ │
+│  │  │ Title patterns: "announces", "reports", "files"            │ │ │
+│  │  └─────────────────────────────────────────────────────────────┘ │ │
+│  │                              │                                  │ │
+│  │  Stage 2: SOURCE-BASED BOOST │                                  │ │
+│  │  ┌─────────────────────────────▼─────────────────────────────────┐ │ │
+│  │  │ Premium sources: WSJ, Bloomberg, Reuters → upgrade to medium│ │ │
+│  │  │ Pre-scored: Marketaux, Massive → medium                    │ │ │
+│  │  │ Institutional: Alpaca/Benzinga, Polygon → high             │ │ │
+│  │  └─────────────────────────────┬─────────────────────────────────┘ │ │
+│  │                              │                                  │ │
+│  │  Stage 3: CLAUDE REFINEMENT (edge cases only)                  │ │
+│  │  ┌─────────────────────────────▼─────────────────────────────────┐ │ │
+│  │  │ IF rules_score == "unknown" OR borderline cases            │ │ │
+│  │  │ → quick Claude call: "medium vs low materiality?"          │ │ │
+│  │  │ ELSE: skip Claude (cost control)                           │ │ │
+│  │  └─────────────────────────────────────────────────────────────┘ │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                                   │                                  │
+│  OUTPUT: articles tagged with materiality → route to analysis       │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                 COMPREHENSIVE ANALYSIS                              │
+│              (REPLACES sentiment.py)                                │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │                    analysis.py                                  │ │
+│  │                                                                 │ │
+│  │  ┌─────────────────────┐         ┌─────────────────────────────┐ │ │
+│  │  │  HIGH MATERIALITY   │         │   MEDIUM/LOW MATERIALITY    │ │ │
+│  │  │                     │         │                             │ │ │
+│  │  │ FULL CLAUDE CALL:   │         │ BASIC ANALYSIS:             │ │ │
+│  │  │ • Thesis extraction │         │ • Simple ticker sentiment   │ │ │
+│  │  │ • Theme/mechanism   │         │ • Direction + confidence    │ │ │
+│  │  │ • Implied tickers   │         │ • Use pre-scored if avail   │ │ │
+│  │  │ • Direct sentiment  │         │   (Marketaux/Massive)       │ │ │
+│  │  │ • Time horizon      │         │                             │ │ │
+│  │  └─────────────────────┘         └─────────────────────────────┘ │ │
+│  │             │                                │                   │ │
+│  └─────────────┼────────────────────────────────┼───────────────────┘ │
+│                │                                │                     │
+└────────────────┼────────────────────────────────┼─────────────────────┘
+                 │                                │
+                 ▼                                │
+┌─────────────────────────────────────────────────┼─────────────────────┐
+│                THESIS MANAGEMENT                │                     │
+│                                                 │                     │
+│  ┌─────────────────────────────────────────────┐│                     │
+│  │            thesis_lifecycle.py              ││                     │
+│  │                                             ││                     │
+│  │ 1. Match against existing active_theses:    ││                     │
+│  │    • Theme similarity (keywords)            ││                     │
+│  │    • Ticker overlap                         ││                     │
+│  │    • Mechanism similarity                   ││                     │
+│  │                                             ││                     │
+│  │ 2. IF MATCH FOUND:                          ││                     │
+│  │    • Add to thesis_evidence table           ││                     │
+│  │    • Update conviction_score                ││                     │
+│  │    • Evolve thesis_statement                ││                     │
+│  │    • Check lifecycle transition:            ││                     │
+│  │      emerging→developing→confirmed→consensus ││                     │
+│  │                                             ││                     │
+│  │ 3. IF NO MATCH:                             ││                     │
+│  │    • Create new thesis (EMERGING state)     ││                     │
+│  │                                             ││                     │
+│  │ 4. Expire old theses (no evidence >5 days)  ││                     │
+│  └─────────────────────────────────────────────┘│                     │
+│                              │                  │                     │
+└──────────────────────────────┼──────────────────┼─────────────────────┘
+                               │                  │
+                               ▼                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                 ENHANCED DATABASE                                   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │                    active_theses                                │ │
+│  │ • id, thesis_statement, theme, direction, mechanism             │ │
+│  │ • lifecycle_stage, confidence_score, conviction_score           │ │
+│  │ • tickers (JSON), sectors (JSON), time_horizon                  │ │
+│  │ • created_at, last_updated, expires_at                          │ │
+│  │ • thesis_history (JSON), evidence_count, source_diversity       │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │                  thesis_evidence                                │ │
+│  │ • thesis_id, article_url, source, published_at                 │ │
+│  │ • added_conviction, reasoning, materiality                      │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │ sentiment_scores (for non-thesis articles)                     │ │
+│  │ • ticker, sentiment_score, urgency, materiality, reasoning     │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                  THESIS-DRIVEN STRATEGIES                          │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │                  strategies.py (REWRITTEN)                     │ │
+│  │                                                                 │ │
+│  │ TIER 1 - THESIS LIFECYCLE STRATEGIES:                          │ │
+│  │ ┌─────────────┐┌─────────────┐┌─────────────┐┌─────────────────┐ │ │
+│  │ │first_mover  ││conviction   ││thesis       ││thesis_fade      │ │ │
+│  │ │_thesis      ││_builder     ││_momentum    ││_exit            │ │ │
+│  │ │             ││             ││             ││                 │ │ │
+│  │ │EMERGING     ││DEVELOPING   ││Accelerating ││CONSENSUS        │ │ │
+│  │ │1-2 articles ││3+ articles  ││conviction   ││/EXPIRED         │ │ │
+│  │ │High risk/   ││2+ sources   ││growing      ││Take profit      │ │ │
+│  │ │reward       ││Normal size  ││Add position ││Exit signal      │ │ │
+│  │ └─────────────┘└─────────────┘└─────────────┘└─────────────────┘ │ │
+│  │                                                                 │ │
+│  │ TIER 2 - SENTIMENT FALLBACK:                                   │ │
+│  │ ┌─────────────┐┌─────────────┐┌─────────────┐                  │ │
+│  │ │sentiment    ││multi_source ││sentiment    │                  │ │
+│  │ │_divergence  ││_consensus   ││_momentum    │                  │ │
+│  │ │(enhanced)   ││(fallback)   ││(fallback)   │                  │ │
+│  │ │             ││             ││             │                  │ │
+│  │ │For non-     ││Direct ticker││Historical   │                  │ │ │
+│  │ │thesis tickers││sentiment    ││sentiment    │                  │ │
+│  │ └─────────────┘└─────────────┘└─────────────┘                  │ │
+│  │                                                                 │ │
+│  │ TIER 3 - TECHNICAL TIMING:                                     │ │
+│  │ ┌─────────────┐┌─────────────┐┌─────────────┐                  │ │
+│  │ │volume       ││vwap         ││relative     │                  │ │
+│  │ │_confirmation││_position    ││_strength    │                  │ │
+│  │ │"act now?"   ││"act now?"   ││"act now?"   │                  │ │
+│  │ └─────────────┘└─────────────┘└─────────────┘                  │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                   THESIS-FIRST COMBINER                            │
+│                                                                     │
+│  Stage 1: THESIS SIGNALS VOTE                                      │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │ For each ticker:                                                │ │
+│  │ • Find active theses implicating this ticker                   │ │
+│  │ • Weight by lifecycle: emerging=0.6, developing=1.0,           │ │
+│  │   confirmed=0.8, consensus=0.3                                 │ │
+│  │ • Weight by conviction_score                                    │ │
+│  │ • Resolve thesis conflicts (opposing directions)               │ │
+│  └─────────────────────┬───────────────────────────────────────────┘ │
+│                        │                                            │
+│  Stage 2: SENTIMENT CONFIRMATION                                   │
+│  ┌─────────────────────▼───────────────────────────────────────────┐ │
+│  │ • Direct sentiment signals confirm/contradict thesis direction │ │
+│  │ • Agreement: boost confidence                                   │ │
+│  │ • Disagreement: dampen confidence                              │ │
+│  │ • No thesis + strong sentiment: fallback signal                │ │
+│  └─────────────────────┬───────────────────────────────────────────┘ │
+│                        │                                            │
+│  Stage 3: TECHNICAL TIMING                                         │
+│  ┌─────────────────────▼───────────────────────────────────────────┐ │
+│  │ • Volume surge on thesis ticker → accelerate                   │ │
+│  │ • RSI extreme → delay entry                                     │ │
+│  │ • VWAP position → fine-tune timing                              │ │
+│  └─────────────────────┬───────────────────────────────────────────┘ │
+│                        │                                            │
+│  Stage 4: REGIME-THESIS INTERACTION                                │
+│  ┌─────────────────────▼───────────────────────────────────────────┐ │
+│  │ • Risk-off + growth thesis → heavy dampen/kill                 │ │
+│  │ • Risk-off + defensive thesis → boost                          │ │
+│  │ • Risk-on + any thesis → normal processing                     │ │
+│  │ • Select which thesis categories are actionable                │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│              RISK/MANAGER.PY (enhanced)                             │
+│                                                                     │
+│ Position sizing now considers thesis lifecycle:                     │
+│ • EMERGING thesis → 0.5x normal size (high risk)                   │
+│ • DEVELOPING thesis → 1.0x normal size                             │
+│ • CONFIRMED thesis → 1.2x normal size                              │ │
+│ • CONSENSUS thesis → 0.3x normal size (exit signal)                │ │
+│                                                                     │
+│ Same 7 hard rules, but thesis-aware stops:                         │
+│ • Thesis-driven trades → wider stops (thesis may take time)        │
+│ • Sentiment-only trades → tighter stops (quicker moves)            │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                EXECUTOR/ALPACA.PY                                   │
+│                   (unchanged)                                       │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                THESIS-AWARE FEEDBACK                                │
+│                                                                     │
+│  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────────┐ │
+│  │  LOGGER.PY      │  │   OUTCOMES.PY    │  │    WEIGHTS.PY       │ │
+│  │  (enhanced)     │  │   (enhanced)     │  │    (enhanced)       │ │
+│  │                 │  │                  │  │                     │ │
+│  │ Log trades with:│  │ Dual measurement │  │ Update weights for: │ │
+│  │ • thesis_id     │  │ windows:         │  │ • Strategy weights  │ │
+│  │ • lifecycle_    │  │ • 8hr for        │  │ • THESIS weights    │ │
+│  │   stage         │  │   sentiment      │  │   (by theme)        │ │
+│  │ • signal_       │  │ • 3-5 days for   │  │ • Lifecycle stage   │ │
+│  │   attribution   │  │   thesis trades  │  │   weights           │ │
+│  │                 │  │                  │  │ • Materiality       │ │
+│  │                 │  │ Attribution to   │  │   classification    │ │
+│  │                 │  │ thesis vs        │  │   accuracy          │ │
+│  │                 │  │ sentiment        │  │                     │ │
+│  └─────────────────┘  └──────────────────┘  └─────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘

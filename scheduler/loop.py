@@ -185,7 +185,9 @@ def run_trading_cycle(is_premarket: bool = False) -> Dict[str, Any]:
     sentiment_results = []
     ticker_sentiments: Dict[str, Dict] = {}
     try:
-        from engine.sentiment import batch_analyze_articles, batch_record_sentiments
+        # TODO: Replace with thesis-driven analysis.py
+        # from engine.sentiment import batch_analyze_articles, batch_record_sentiments
+        pass
         if articles:
             sentiment_results = batch_analyze_articles(articles)
 
@@ -255,7 +257,9 @@ def run_trading_cycle(is_premarket: bool = False) -> Dict[str, Any]:
     # ── 8. Load learned weights ────────────────────────────────────────
     learned_weights: Dict[str, float] = {}
     try:
-        from engine.combiner import load_learned_weights
+        # TODO: Replace with thesis-aware weight loader
+        # from engine.combiner import load_learned_weights
+        pass
         learned_weights = load_learned_weights()
     except Exception as e:
         logger.warning(f"Could not load learned weights: {e}")
@@ -288,7 +292,9 @@ def run_trading_cycle(is_premarket: bool = False) -> Dict[str, Any]:
                 continue
 
             # Run strategies
-            from engine.strategies import run_all_strategies
+            # TODO: Replace with thesis lifecycle strategies
+            # from engine.strategies import run_all_strategies
+            pass
             raw_output = run_all_strategies(
                 ticker=ticker,
                 market_data=ticker_market,
@@ -301,7 +307,9 @@ def run_trading_cycle(is_premarket: bool = False) -> Dict[str, Any]:
                 continue
 
             # Combine signals
-            from engine.combiner import combine_ticker_signals
+            # TODO: Replace with thesis-first combiner
+            # from engine.combiner import combine_ticker_signals
+            pass
             combined = combine_ticker_signals(
                 ticker=ticker,
                 raw_output=raw_output,
