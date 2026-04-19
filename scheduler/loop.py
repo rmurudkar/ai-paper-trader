@@ -75,11 +75,15 @@ def run_trading_cycle(is_premarket: bool = False) -> Dict[str, Any]:
       1. Circuit breaker check
       2. Market hours check (skip execution if closed, unless premarket)
       3. Discovery — find active tickers
-      4. Fetch news via aggregator
-      5. Sentiment analysis (batch)
+      4. Fetch news via aggregator (+ dedupe seen URLs)
+      5. Materiality classification (rules + source + optional Claude)
+      5b. Comprehensive analysis (thesis extraction for high, sentiment for rest)
+      5c. Thesis lifecycle management (match/create active_theses + evidence)
       6. Fetch market data for discovered tickers
-      7. Per-ticker: strategies -> combiner -> risk check -> execute
-      8. Log all trades
+      7. Regime classification
+      8. Load learned weights
+      9. Per-ticker: strategies -> combiner -> risk check -> execute
+      10. Log all trades
 
     Args:
         is_premarket: True for the 9:00 AM pre-market run (sector rotation on).
@@ -203,6 +207,71 @@ def run_trading_cycle(is_premarket: bool = False) -> Dict[str, Any]:
         logger.error(f"Cycle {cycle_id}: {msg}\n{traceback.format_exc()}")
         errors.append(msg)
     phase_timings["materiality"] = int((time.monotonic() - t0) * 1000)
+
+    # ── 5b. Comprehensive analysis (thesis extraction + sentiment) ─────
+    # Routes each article by materiality: high → full Claude thesis
+    # extraction via thesis_extractor; medium/low → basic sentiment. Active
+    # theses are passed as novelty context so Claude can calibrate the
+    # lifecycle_hint for genuinely new vs. already-tracked narratives.
+    t0 = time.monotonic()
+    analyzed_articles: List[Dict] = []
+    try:
+        if articles:
+            from engine.analysis import analyze_articles
+            from db.client import get_active_theses
+
+            try:
+                existing_theses = get_active_theses(exclude_expired=True)
+            except Exception as e:
+                logger.warning(
+                    f"Cycle {cycle_id}: Could not fetch active theses "
+                    f"for novelty context: {e}"
+                )
+                existing_theses = []
+
+            analyzed_articles = analyze_articles(
+                articles,
+                existing_theses=existing_theses,
+            )
+            theses_extracted = sum(
+                1 for a in analyzed_articles if a.get("thesis_extracted")
+            )
+            sentiment_only = len(analyzed_articles) - theses_extracted
+            logger.info(
+                f"Cycle {cycle_id}: Analysis — "
+                f"{theses_extracted} theses extracted, "
+                f"{sentiment_only} sentiment-only"
+            )
+    except Exception as e:
+        msg = f"Analysis failed: {e}"
+        logger.error(f"Cycle {cycle_id}: {msg}\n{traceback.format_exc()}")
+        errors.append(msg)
+    phase_timings["analysis"] = int((time.monotonic() - t0) * 1000)
+
+    # ── 5c. Thesis lifecycle management ────────────────────────────────
+    # Match newly-extracted theses against active_theses; on match add
+    # evidence + bump conviction + transition lifecycle; on no match create
+    # a new thesis in EMERGING. Also expires stale theses (>5 days).
+    t0 = time.monotonic()
+    try:
+        thesis_articles = [a for a in analyzed_articles if a.get("thesis_extracted")]
+        if thesis_articles:
+            from engine.thesis_lifecycle import process_theses
+            lifecycle_results = process_theses(thesis_articles)
+            created = sum(1 for r in lifecycle_results if r["action"] == "created")
+            matched = sum(1 for r in lifecycle_results if r["action"] == "matched")
+            duplicates = sum(
+                1 for r in lifecycle_results if r["action"] == "duplicate_evidence"
+            )
+            logger.info(
+                f"Cycle {cycle_id}: Thesis lifecycle — "
+                f"{created} new, {matched} matched, {duplicates} duplicates"
+            )
+    except Exception as e:
+        msg = f"Thesis lifecycle failed: {e}"
+        logger.error(f"Cycle {cycle_id}: {msg}\n{traceback.format_exc()}")
+        errors.append(msg)
+    phase_timings["thesis_lifecycle"] = int((time.monotonic() - t0) * 1000)
 
     # ── 6. Market data ─────────────────────────────────────────────────
     # tickers may have grown via sector_macro — fetch covers all of them.
