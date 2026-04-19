@@ -1,8 +1,11 @@
-# Autonomous Paper Trading App
+# Autonomous Thesis-Driven Paper Trading App
 
-Python app that runs continuously, fetches financial news, analyzes sentiment with
-Claude API, combines with technical strategies, enforces risk rules, executes paper
-trades via Alpaca, and learns from its own performance. Paper trading only — no real money.
+Python app that runs continuously, fetches financial news, extracts investment theses with
+Claude API, tracks thesis lifecycles, combines with technical strategies, enforces risk rules,
+executes paper trades via Alpaca, and learns from its own performance. Paper trading only — no real money.
+
+**Core Innovation**: Forward-looking thesis-driven trading that identifies market narratives before
+they become consensus. The bot connects dots the market hasn't connected yet.
 
 ## Stack
 - Python 3.11+, Anthropic SDK, APScheduler, Streamlit + Plotly
@@ -29,10 +32,13 @@ paper-trader/
 │   ├── market.py                # yfinance price/volume/MA/RSI/macro + S&P 500
 │   └── aggregator.py            # 4-step waterfall + dedup + merge all 5 sources
 ├── engine/
-│   ├── sentiment.py             # Claude sentiment with urgency/materiality/time_horizon
-│   ├── strategies.py            # Cat 1/2/3 strategies + standalone technical
+│   ├── materiality_classifier.py # 3-stage materiality filter (rules, source, Claude)
+│   ├── analysis.py              # Comprehensive analysis engine (replaces sentiment.py)
+│   ├── thesis_extractor.py      # Claude thesis extraction from high materiality news
+│   ├── thesis_lifecycle.py      # Thesis matching, evolution, lifecycle management
+│   ├── strategies.py            # Thesis-driven strategies (4 tiers)
 │   ├── regime.py                # Macro regime: risk_on / neutral / risk_off
-│   └── combiner.py              # 4-stage weighted signal combiner
+│   └── combiner.py              # Thesis-first combiner (4-stage pipeline)
 ├── risk/manager.py              # Position sizing + 7 hard rules
 ├── executor/alpaca.py           # Alpaca paper trade executor
 ├── feedback/
@@ -78,11 +84,19 @@ SLACK_WEBHOOK_URL=             # optional
 ```
 
 ## Implementation Status
-- **Complete**: all fetchers, risk/manager.py, executor/alpaca.py,
-  all feedback modules, dashboard/app.py, db/client.py, db/schema.sql
+- **Complete**: all fetchers, risk/manager.py, executor/alpaca.py, db/client.py, db/schema.sql
 - **Stub**: scheduler/loop.py
-- **Deleted (thesis redesign)**: engine/signals.py, engine/sentiment.py, engine/strategies.py, engine/combiner.py
-- **To implement**: engine/analysis.py, engine/thesis_extractor.py, engine/thesis_lifecycle.py, materiality_classifier.py, new strategies.py, new combiner.py
+- **Deleted (thesis redesign)**: engine/signals.py, engine/sentiment.py, old engine/strategies.py, old engine/combiner.py
+- **To implement**: 
+  - engine/materiality_classifier.py — 3-stage materiality filtering
+  - engine/analysis.py — comprehensive analysis with thesis extraction routing
+  - engine/thesis_extractor.py — Claude thesis extraction for high materiality articles
+  - engine/thesis_lifecycle.py — thesis matching, evolution, lifecycle management
+  - new engine/strategies.py — thesis-driven strategy system (4 tiers)
+  - new engine/combiner.py — thesis-first combiner
+  - Enhanced feedback modules for thesis-aware learning
+  - Enhanced dashboard/app.py with thesis tracking
+  - Database schema updates for thesis tables
 
 ## Hard Rules — Never Violate These
 - NEVER send raw headlines to Claude for sentiment — always use `full_text`
@@ -103,22 +117,154 @@ SLACK_WEBHOOK_URL=             # optional
 - ALWAYS cache sector lookups in Turso `sector_cache` after yfinance fetch
 - Cat 2 strategies (volume, VWAP, relative strength) are MODIFIERS only — never standalone signals
 - Groq extraction is OPTIONAL — always combine with regex, degrade gracefully without GROQ_API_KEY
+- NEVER extract theses from low materiality articles — waste of Claude API calls
+- ALWAYS route high materiality articles through full thesis extraction
+- NEVER hold thesis positions past CONSENSUS lifecycle stage — exit signal
+- ALWAYS enter thesis positions in EMERGING/DEVELOPING stages for alpha
+- NEVER ignore thesis lifecycle when sizing positions
+- ALWAYS log thesis_id and lifecycle_stage with every trade for feedback loops
 
 ## Ticker Modes
 **watchlist** — WATCHLIST env var tickers only. Lower API usage, predictable.
 
 **discovery** (default) — Finds tickers from: news mentions, S&P 500 market movers
-(dynamically fetched), sector rotation across 20 ETFs, existing positions, WATCHLIST pins.
-Validates each ticker: price ≥ $5, market cap ≥ $1B, avg volume ≥ 500K.
-Capped at MAX_DISCOVERY_TICKERS. Positions and watchlist tickers exempt from cap.
+(dynamically fetched), sector rotation across 20 ETFs, **active thesis implications**, 
+existing positions, WATCHLIST pins. Validates each ticker: price ≥ $5, market cap ≥ $1B, 
+avg volume ≥ 500K. Capped at MAX_DISCOVERY_TICKERS. Positions, watchlist, and thesis-implied 
+tickers exempt from cap.
+
+## Thesis Lifecycle System
+
+**Core Concept**: Investment theses have a natural lifecycle that determines optimal trading timing:
+
+1. **EMERGING** — 1-2 articles, 1 source, <1 cycle old. Market hasn't noticed. **First-mover advantage window.**
+2. **DEVELOPING** — 3+ articles, 2+ sources, 1-3 cycles. Smart money positioning. **Primary entry window.**  
+3. **CONFIRMED** — 4+ articles, 3+ sources, institutional flow. **Scale-up window.**
+4. **CONSENSUS** — Everyone talking, ticker moved 5%+. **Exit signal.**
+
+**Strategy**: Enter EMERGING/DEVELOPING, scale CONFIRMED, exit CONSENSUS. Alpha lives in the gaps before consensus.
+
+## Thesis-Driven Strategy Tiers
+
+**Tier 1 — Thesis Lifecycle Strategies** (Primary signals):
+- `first_mover_thesis`: EMERGING thesis, 1-2 articles, high materiality. Small size, wide stops, high alpha potential.
+- `conviction_builder`: DEVELOPING thesis, 3+ articles, 2+ sources. Bread-and-butter strategy, normal size.
+- `thesis_momentum`: Accelerating conviction (more articles per cycle). Add to positions.
+- `thesis_fade_exit`: CONSENSUS/expired thesis. Exit signal, take profits.
+- `counter_thesis`: New thesis contradicts existing. Reduce/exit conflicted positions.
+
+**Tier 2 — Sentiment Fallback** (Non-thesis tickers):
+- Enhanced versions of sentiment_divergence, multi_source_consensus, sentiment_momentum
+- Only fire when no thesis implicates the ticker
+
+**Tier 3 — Technical Timing** (Modifiers):
+- `volume_confirmation`, `vwap_position`, `relative_strength` 
+- Now thesis-aware: "does chart confirm thesis timing?"
+
+**Tier 4 — Regime-Thesis Interaction** (Filter):
+- Risk-off + growth thesis → dampen/kill
+- Risk-off + defensive thesis → boost  
+- Risk-on + any thesis → normal processing
 
 ## When to Load Skills
 - Building, debugging, or modifying any module → load `.claude/skills/architecture/SKILL.md`
 - Writing DB queries, migrations, or new tables → load `.claude/skills/schema/SKILL.md`
 - Wiring modules together or checking return shapes → load `.claude/skills/api-contracts/SKILL.md`
-```
 
 ---
+
+## Thesis-Driven Architecture Flow
+
+### 1. Discovery Enhancement
+- **New source**: Active thesis implications — tickers from `active_theses` table
+- **Priority order**: News mentions → Market movers → Sector rotation → **Thesis implications** → Positions → Watchlist
+- **Thesis-implied tickers exempt** from MAX_DISCOVERY_TICKERS cap
+
+### 2. Materiality Filtering (NEW)
+**3-Stage Pipeline** in `materiality_classifier.py`:
+
+**Stage 1: Rules-Based Detection**
+- High materiality keywords: earnings, guidance, CEO, merger, FDA, regulatory
+- Multi-ticker articles (≥3 tickers) → medium materiality
+- Title patterns: "announces", "reports", "files" → potential high
+
+**Stage 2: Source-Based Boost**  
+- Premium sources (WSJ, Bloomberg, Reuters) → upgrade to medium
+- Pre-scored sources (Marketaux, Massive) → medium
+- Institutional feeds (Alpaca/Benzinga, Polygon) → high
+
+**Stage 3: Claude Refinement** (Cost-controlled)
+- Only for rules_score == "unknown" OR borderline cases
+- Quick Claude call: "medium vs low materiality?"
+- Skip Claude for clear high/low cases
+
+**Output**: Articles tagged with materiality level → route to appropriate analysis
+
+### 3. Comprehensive Analysis (REPLACES sentiment.py)
+**Dual-track processing** in `analysis.py`:
+
+**High Materiality Track**:
+- Full Claude thesis extraction via `thesis_extractor.py`
+- Extract: thesis statement, theme, mechanism, implied tickers, sentiment, time horizon
+- Rich, forward-looking analysis for thesis system
+
+**Medium/Low Materiality Track**:  
+- Basic sentiment analysis only
+- Use pre-scored sentiment when available (Marketaux/Massive)
+- Lightweight processing for direct sentiment strategies
+
+### 4. Thesis Management
+**Lifecycle tracking** in `thesis_lifecycle.py`:
+
+**Matching Logic**:
+1. Compare new thesis against existing `active_theses`
+2. Match on: theme keywords, ticker overlap, mechanism similarity
+3. If match found → add to `thesis_evidence`, update conviction, evolve statement
+4. If no match → create new thesis (EMERGING state)
+5. Lifecycle transitions: emerging→developing→confirmed→consensus
+6. Expire theses with no evidence >5 days
+
+**Database Tables**:
+- `active_theses`: Core thesis data, lifecycle state, conviction scores
+- `thesis_evidence`: Supporting articles, conviction contributions  
+- `sentiment_scores`: Fallback sentiment for non-thesis articles
+
+### 5. Thesis-First Strategies
+**4-Stage Strategy System** in new `strategies.py`:
+
+**Primary**: Thesis lifecycle strategies determine most trades
+**Secondary**: Sentiment fallback for non-thesis tickers  
+**Modifiers**: Technical timing factors  
+**Filter**: Regime-thesis interaction
+
+Position sizing reflects lifecycle stage:
+- EMERGING: 0.5x size (high risk)
+- DEVELOPING: 1.0x size  
+- CONFIRMED: 1.2x size
+- CONSENSUS: 0.3x size (exit signal)
+
+### 6. Thesis-First Combiner
+**4-Stage Pipeline** in new `combiner.py`:
+
+**Stage 1**: Thesis signals vote (weighted by lifecycle + conviction)
+**Stage 2**: Sentiment confirmation (boost agreement, dampen conflict)  
+**Stage 3**: Technical timing (volume surge, RSI extremes, VWAP position)
+**Stage 4**: Regime-thesis interaction (select actionable thesis categories)
+
+Key difference: Resolves conflicts between **theses**, not strategies.
+
+### 7. Enhanced Feedback Loop
+**Thesis-aware measurement**:
+- Dual timeframes: 8hr for sentiment, 3-5 days for thesis trades
+- Track thesis_id, lifecycle_stage in trade logs
+- Update strategy weights AND thesis theme weights
+- Measure materiality classification accuracy
+
+### 8. Enhanced Risk Management
+**Thesis lifecycle position sizing**:
+- Wider stops for thesis trades (theses take time to play out)
+- Tighter stops for sentiment-only trades (quicker moves)
+- Thesis-aware sector limits and concentration rules
 
 **.claude/skills/architecture/SKILL.md**
 
@@ -126,15 +272,15 @@ Capped at MAX_DISCOVERY_TICKERS. Positions and watchlist tickers exempt from cap
 ---
 name: architecture
 description: >
-  Full data flow narrative for the autonomous paper trader. Load this when building,
-  debugging, or modifying any module. Covers the complete pipeline from scheduler
-  through feedback loop, including the 4-step waterfall enrichment, 4-stage signal
-  combiner, sentiment enrichment model, and strategy category system.
+  Full data flow narrative for the thesis-driven autonomous paper trader. Load this when building,
+  debugging, or modifying any module. Covers the complete pipeline from scheduler through thesis
+  management, including materiality filtering, thesis extraction, lifecycle management, thesis-driven
+  strategies, and thesis-aware feedback loops.
   Trigger when the user says "how does X work", "implement X", "fix X", or asks
   about any module's behavior, inputs, or outputs.
 ---
 
-# Architecture — Full Data Flow
+# Thesis-Driven Architecture — Full Data Flow
 
 ## 1. Scheduler (scheduler/loop.py) — STUB
 - Primary job: every 15 minutes during market hours (9:30 AM – 4:00 PM ET)
@@ -147,16 +293,18 @@ description: >
 
 **Watchlist mode**: return WATCHLIST env var tickers only.
 
-**Discovery mode** — 5 sources in priority order:
+**Discovery mode** — 6 sources in priority order:
 1. News mentions: scan Marketaux + Massive + NewsAPI for ticker symbols via regex
    ($AAPL, NASDAQ:AAPL) + optional Groq company name recognition. 2+ mentions = add ticker.
 2. Market movers: fetch full S&P 500 list (Wikipedia → Turso sp500_cache → static fallback),
    `yf.download()` 2-day history, compute daily change %, top 5 gainers + top 5 losers.
-3. Sector rotation (pre-market only): 20 ETFs (11 SPDR sectors + VTV, VUG, RSP, IWM,
+3. **Active thesis implications**: extract tickers from `active_theses` table where 
+   lifecycle_stage ∈ [EMERGING, DEVELOPING, CONFIRMED]. Thesis-driven discovery.
+4. Sector rotation (pre-market only): 20 ETFs (11 SPDR sectors + VTV, VUG, RSP, IWM,
    EEM, VEA, QQQ, IVV, VTI). Fetch holdings dynamically via yfinance (fallback: hardcoded map).
    Top 3 holdings from top 2 + bottom 2 ETFs by 1-month performance.
-4. Existing positions: always include held tickers.
-5. WATCHLIST pins: always included, exempt from cap.
+5. Existing positions: always include held tickers.
+6. WATCHLIST pins: always included, exempt from cap.
 
 **Validation** (before adding any ticker): price ≥ $5, market cap ≥ $1B,
 avg volume ≥ 500K. Cache in `validation_cache` SQLite (7-day TTL).
@@ -230,134 +378,212 @@ keep article with full_text over snippet-only.
 
 Returns: unified list sorted by published_at descending.
 
-## 5. Sentiment Engine (engine/sentiment.py)
+## 5. Materiality Filtering (engine/materiality_classifier.py)
 
-**Routing:**
-- source == "marketaux" OR "massive" → pass sentiment_score directly, skip Claude
-- source == "newsapi" / "alpaca" / "polygon" → send full_text to Claude
+**3-stage pipeline** for cost-controlled thesis extraction:
+
+**Stage 1: Rules-Based Detection**
+- High materiality keywords: earnings, guidance, CEO, merger, FDA, regulatory, acquisition
+- Multi-ticker threshold: ≥3 tickers mentioned → medium materiality
+- Title patterns: "announces", "reports", "files", "launches" → boost score
+- Returns: "high" | "medium" | "low" | "unknown"
+
+**Stage 2: Source-Based Boost**
+- Premium sources (wsj.com, bloomberg.com, reuters.com) → upgrade to medium
+- Pre-scored sources (Marketaux, Massive) → medium (already have sentiment)  
+- Institutional feeds (Alpaca/Benzinga, Polygon) → high (professional grade)
+- Low-quality sources → downgrade by one level
+
+**Stage 3: Claude Refinement** (Edge cases only)
+- Trigger: rules_score == "unknown" OR borderline classification
+- Quick Claude call: "Is this medium or low materiality for trading?"
+- Cost control: Skip Claude for clear high/low cases
+- Uses `claude-3-haiku-20240307`, temperature=0.1, max_tokens=100
+
+**Output routing:**
+- High materiality → Full thesis extraction via `thesis_extractor.py`
+- Medium/Low materiality → Basic sentiment analysis via `analysis.py`
+
+## 6. Comprehensive Analysis (engine/analysis.py) — REPLACES sentiment.py
+
+**Dual-track processing** based on materiality:
+
+**High Materiality Track:**
+- Route to `thesis_extractor.py` for full Claude thesis extraction
+- Extract: thesis statement, theme, mechanism, implied tickers, sentiment, time horizon
+- Send to `thesis_lifecycle.py` for thesis matching/creation
+- Rich forward-looking analysis
+
+**Medium/Low Materiality Track:**
+- Basic sentiment analysis only  
+- Routing: source == "marketaux" OR "massive" → use pre-scored sentiment
+- source == "newsapi"/"alpaca"/"polygon" → lightweight Claude sentiment call
 - Never send headlines to Claude, never send text >1200 words
+- Uses `claude-3-haiku-20240307`, temperature=0.1, max_tokens=200
 
-**Claude call** uses `claude-3-haiku-20240307`, temperature=0.1, max_tokens=400.
-
-**Enriched output per article per ticker:**
+**Sentiment output per article per ticker:**
 ```python
 {
     "sentiment_score": float,   # -1.0 to 1.0, clamped
-    "urgency": str,             # "breaking" | "developing" | "standard"
-    "materiality": str,         # "high" | "medium" | "low" | "unknown"
+    "urgency": str,             # "breaking" | "developing" | "standard"  
+    "reasoning": str,
+    "published_at": str,
+    "source": str,
+    "materiality": str          # from materiality_classifier
+}
+```
+
+**Thesis output per article** (high materiality only):
+```python
+{
+    "thesis_statement": str,    # Investment thesis extracted
+    "theme": str,               # Categorical theme (AI, earnings, regulatory, etc.)
+    "direction": str,           # "bullish" | "bearish" | "neutral"
+    "mechanism": str,           # How the thesis plays out
+    "implied_tickers": list,    # Secondary tickers beyond directly mentioned
     "time_horizon": str,        # "intraday" | "short_term" | "medium_term" | "long_term"
+    "confidence": float,        # Claude's confidence in thesis (0-1)
     "reasoning": str,
     "published_at": str,
     "source": str
 }
 ```
 
-**Weighted aggregation** per ticker (get_ticker_sentiment_scores):
+## 7. Thesis Management (engine/thesis_lifecycle.py)
 
-| Factor | Values |
-|--------|--------|
-| Source credibility | newsapi/alpaca/polygon=1.0, marketaux=0.8, massive=0.6 |
-| Materiality | high=2.0×, medium=1.0×, low=0.5×, unknown=0.5× |
-| Urgency | breaking=2.0×, developing=1.3×, standard=1.0× |
-| Recency | <1hr=3.0×, 1-3hr=2.0×, 3-6hr=1.0×, 6+hr=0.5× |
+**Core workflow:**
+1. Receive thesis from `analysis.py` high materiality track
+2. Match against existing `active_theses` via similarity scoring
+3. If match: update thesis, add evidence, evolve lifecycle
+4. If no match: create new thesis in EMERGING state
+5. Lifecycle transitions based on evidence accumulation
+6. Expire stale theses (>5 days no evidence)
 
-Weighted average = Σ(score × weight) / Σ(weight). Floor: weight ≥ 0.1.
+**Matching algorithm:**
+- Theme keyword similarity (cosine similarity >0.7)
+- Ticker overlap (Jaccard similarity >0.5)  
+- Mechanism similarity (semantic comparison)
+- Combined score > threshold → match found
 
-**Sentiment history tracking** (record_ticker_sentiment):
-1. Aggregate via get_ticker_sentiment_scores
-2. Fetch previous cycle score from `sentiment_history` table
-3. Compute delta = current - previous
-4. delta > +0.1 = bullish_shift, < -0.1 = bearish_shift, else stable
-5. Save current score to `sentiment_history`
+**Lifecycle transitions:**
+- EMERGING → DEVELOPING: 3+ supporting articles, 2+ sources
+- DEVELOPING → CONFIRMED: 4+ articles, 3+ sources, institutional mentions
+- CONFIRMED → CONSENSUS: 6+ articles, price movement >3%, broad coverage
+- Any stage → EXPIRED: no supporting evidence >5 days
 
-**Enriched aggregated output** adds to base aggregation:
-- dominant urgency (breaking > developing > standard)
-- highest materiality (high > medium > low > unknown)
-- shortest time_horizon (intraday > short_term > medium_term > long_term)
-- sentiment_delta, previous_score, delta_direction
+**Conviction scoring:**
+- Each supporting article adds conviction based on source credibility + materiality
+- Conviction decay over time without fresh evidence
+- Conviction influences position sizing and strategy weights
 
-## 6. Strategies (engine/strategies.py)
+**Database writes:**
+- Update `active_theses` table with new conviction, lifecycle stage
+- Add record to `thesis_evidence` table linking article to thesis
+- Track thesis evolution in `thesis_history` JSON field
 
-Generates raw unweighted signals and modifiers. No regime logic here — that's combiner.py.
+## 8. Thesis-Driven Strategies (engine/strategies.py) — REWRITTEN
 
-**Category 1 — Sentiment-Reactive (primary signals):**
+**4-Tier Strategy System** focused on thesis lifecycle timing:
 
-`sentiment_price_divergence`
+**Tier 1 — Thesis Lifecycle Strategies (Primary signals):**
+
+`first_mover_thesis`
+- Target: EMERGING theses (1-2 articles, <2 cycles old)
+- BUY/SELL: Follow thesis direction if implied tickers haven't moved yet
+- High risk/reward: small position, wider stops, potential for large alpha
+- Confidence = thesis.confidence × materiality_boost × (1 - price_change_factor)
+
+`conviction_builder`  
+- Target: DEVELOPING theses (3+ articles, 2+ sources, 1-3 cycles)
+- BUY/SELL: Follow thesis direction with normal position sizing
+- Bread-and-butter strategy: most trades should come from here
+- Confidence = thesis.confidence × conviction_score × source_diversity_factor
+
+`thesis_momentum`
+- Target: Accelerating conviction (conviction_score increasing cycle-over-cycle)
+- BUY/SELL: Add to existing positions when thesis gains momentum
+- Confidence = min(conviction_delta / max_conviction_delta, 0.95)
+
+`thesis_fade_exit`
+- Target: CONSENSUS theses (6+ articles, broad coverage, price moved >3%)
+- Signal: SELL existing positions (profit taking)
+- The market has caught up — edge is gone
+- Confidence = 0.85 (high confidence exit signal)
+
+`counter_thesis`
+- Target: New thesis directly contradicts existing thesis on same tickers
+- Signal: Reduce/exit conflicted positions  
+- Don't try to pick winners — uncertainty itself is the signal
+- Confidence = 0.70
+
+**Tier 2 — Sentiment Fallback (Non-thesis tickers only):**
+
+`sentiment_price_divergence` (enhanced)
+- Only fires when ticker has NO active thesis implication
 - BUY: sentiment > +0.5 AND price_change_pct < +0.5%
 - SELL: sentiment < -0.5 AND price_change_pct > -0.5%
-- confidence = abs(sentiment) × (1 - abs(price_change) / 5.0)
-- Boosts: 3+ articles ×1.1, 2+ sources ×1.05
+- Enhanced with materiality weighting
 
-`multi_source_consensus`
-- Requires: article_count ≥ 3, source count ≥ 2, ALL individual_scores same direction
-  (all > +0.3 for BUY or all < -0.3 for SELL)
-- confidence = min(article_count / 5.0, 1.0) × avg_abs_score
+`multi_source_consensus` (fallback)
+- Direct ticker sentiment from multiple sources
+- Requires: no thesis + article_count ≥ 3 + source_count ≥ 2
+- Fallback for high-conviction non-thesis moves
 
-`sentiment_momentum`
-- Reads `sentiment_history` table via get_previous_sentiment(ticker)
-- BUY: delta > +0.4 since last cycle
-- SELL: delta < -0.4 since last cycle
-- confidence = min(abs(delta) / 1.0, 0.95)
+`sentiment_momentum` (fallback)
+- Historical sentiment tracking for non-thesis tickers
+- BUY: sentiment delta > +0.4 AND no contradicting thesis
 
-**Category 2 — Technical Confirmation (modifiers only, never standalone signals):**
+**Tier 3 — Technical Timing (Thesis-aware modifiers):**
 
-`volume_confirmation` → multiplier
-- volume > 2× avg_volume_20: 1.4
-- volume > 1.5× avg_volume_20: 1.2
-- volume < 0.7× avg_volume_20: 0.6
-- otherwise: 1.0
+`volume_confirmation` → multiplier (thesis-aware)
+- volume > 2× avg on thesis ticker → 1.4× (smart money positioning)
+- volume < 0.7× avg on thesis ticker → 0.6× (thesis not resonating)
 
-`vwap_position` → directional_modifier
-- price > vwap by ≥1%: positive modifier (capped +0.2)
-- price < vwap by ≥1%: negative modifier (capped -0.2)
-- near vwap: 0.0
-- Modifier formula: deviation_pct × 0.05
+`vwap_position` → directional_modifier (timing)
+- price > vwap on bullish thesis → +0.15 modifier (momentum building)
+- price < vwap on bullish thesis → -0.10 modifier (early/wrong timing)
 
 `relative_strength` → directional_modifier
-- spread = ticker_change_pct - spy_change_pct
-- abs(spread) < 1% → 0.0
-- otherwise: spread × 0.05, capped ±0.2
+- thesis ticker outperforming SPY → +0.15 modifier (thesis working)
+- thesis ticker underperforming → -0.10 modifier (thesis not working)
 
-**Category 3 — Post-News Drift:**
+**Tier 4 — Regime-Thesis Interaction (Filters, applied in combiner):**
 
-`news_catalyst_drift`
-- Requires: gap = (price - prev_close) / prev_close × 100
-- BUY: gap > +2% AND (day_high - price) / day_high ≤ 1% (near high, drift intact)
-- SELL: gap < -2% AND (price - day_low) / day_low ≤ 1% (near low, drift intact)
-- confidence = gap_factor × 0.6 + proximity_factor × 0.3 (capped 0.85)
+No strategies here — logic embedded in combiner.py:
+- Risk-off + growth thesis → heavy dampen (0.4×) or kill
+- Risk-off + defensive thesis → boost (1.3×)  
+- Risk-on + any thesis → normal processing
+- Neutral regime → no adjustment
 
-**Standalone technical (no sentiment required):**
+**Position sizing by lifecycle:**
+- EMERGING: 0.5× normal size (high risk, early entry)
+- DEVELOPING: 1.0× normal size (validated thesis)
+- CONFIRMED: 1.2× normal size (institutional confirmation)
+- CONSENSUS: 0.3× normal size (exit mode)
 
-`momentum_signal`
-- BUY: price > ma_20 > ma_50
-- SELL: price < ma_20 < ma_50
-- confidence = max(0.3, min(0.9, 0.3 + trend_strength × 12)) where trend_strength = abs(price - ma_20) / price
-
-`mean_reversion_signal`
-- BUY: rsi < 30 AND price_change_pct > 0
-- SELL: rsi > 70 AND price_change_pct < 0
-- confidence = max(0.3, min(0.7, 0.3 + rsi_extremity / 25))
-
-**Enrichment boost** (applied in all Cat 1 + Cat 3 strategies):
-```python
-urgency:       breaking=1.25×, developing=1.1×, standard=1.0×
-materiality:   high=1.2×,      medium=1.1×,     low/unknown=1.0×
-time_horizon:  intraday=1.15×, short_term=1.05×, medium_term=1.0×, long_term=0.9×
-```
-
-run_all_strategies returns:
+**Enhanced run_all_strategies returns:**
 ```python
 {
-    "signals": [  # non-HOLD only; Cat 3 included here
+    "thesis_signals": [  # Tier 1 only
+        {
+            "signal": "BUY"|"SELL", 
+            "confidence": float, 
+            "strategy": str, 
+            "thesis_id": str,
+            "lifecycle_stage": str,
+            "reason": str
+        }
+    ],
+    "sentiment_signals": [  # Tier 2 fallback
         {"signal": "BUY"|"SELL", "confidence": float, "strategy": str, "reason": str}
     ],
-    "modifiers": [  # Cat 2 only
+    "technical_modifiers": [  # Tier 3 timing
         {"multiplier"|"directional_modifier": float, "modifier_name": str, "reason": str}
     ]
 }
 ```
 
-## 7. Regime Classifier (engine/regime.py)
+## 9. Regime Classifier (engine/regime.py)
 
 Weighted indicator scoring:
 - VIX (35%): <20 → +0.35, >25 → -0.35, between → 0
@@ -369,118 +595,160 @@ Weighted indicator scoring:
 Final score > 0.3 → risk_on. Score < -0.3 → risk_off. Else → neutral.
 Confidence = min(1.0, abs(score) / 0.5), floor 0.1.
 
-## 8. Signal Combiner (engine/combiner.py) — 4-Stage Pipeline
+## 10. Thesis-First Combiner (engine/combiner.py) — 4-Stage Pipeline
 
-**Stage 1 — Primary Direction:**
-- Separate Cat 1 + standalone signals from Cat 3 signals
-- Apply learned weights from `weights` table (default 0.5 if not found)
-- Group by direction: BUY signals vs SELL signals
-- Weighted totals: buy_total = Σ(confidence × weight) for BUY signals
-- Conflict penalty when both directions exist:
-  `base_confidence *= (1.0 - conflict_ratio × 0.3)` where conflict_ratio = losing / (winning + losing)
-- Pick direction with higher weighted total (BUY wins ties)
-- If no signals → HOLD
+**Key difference**: Resolves conflicts between **theses**, not strategies. Thesis signals take precedence.
 
-**Stage 2 — Apply Technical Modifiers:**
-- For each Cat 2 modifier:
-  - multiplier: confidence *= multiplier
-  - directional_modifier: if BUY → confidence *= (1 + dm); if SELL → confidence *= (1 - dm)
-- No regime scaling at this stage
+**Stage 1 — Thesis Signals Vote:**
+- For each ticker: find all active theses implicating this ticker
+- Weight thesis signals by:
+  - Lifecycle stage: emerging=0.6, developing=1.0, confirmed=0.8, consensus=0.3
+  - Conviction score: multiply by thesis.conviction_score (0-1)
+  - Learned thesis weights from `weights` table (by theme)
+- Resolve thesis conflicts (opposing directions on same ticker):
+  - Higher-conviction thesis wins
+  - If convictions close: dampen both by conflict_penalty
+- Thesis vote determines primary direction + confidence
 
-**Stage 3 — Catalyst Drift Integration:**
-- For each Cat 3 signal (news_catalyst_drift):
-  - Agrees with direction: confidence += cat3_confidence × 0.20
-  - Contradicts direction: confidence -= cat3_confidence × 0.15
-  - HOLD cat3: no effect
+**Stage 2 — Sentiment Confirmation:**
+- Direct sentiment signals confirm/contradict thesis direction
+- Agreement (sentiment + thesis same direction): boost confidence × 1.15
+- Disagreement: dampen confidence × 0.85  
+- No thesis + strong sentiment (abs > 0.6): create fallback signal
+- Apply learned sentiment strategy weights
 
-**Stage 4 — Regime Filter:**
-- risk_on + SELL: confidence × 0.80
-- risk_off + BUY: confidence × 0.70
-  - Then gate: if confidence < 0.80 after dampening → HOLD (killed)
-- neutral: no change
+**Stage 3 — Technical Timing:**
+- Apply Tier 3 modifiers based on thesis context:
+  - Volume surge on thesis ticker → accelerate entry (1.2× confidence)
+  - RSI extreme (>75 / <25) → delay entry (0.8× confidence)
+  - VWAP position confirms direction → boost timing (directional modifier)
+- Technical signals now answer: "Is this the right TIME to act on the thesis?"
 
-**Final gate:** confidence clamped to [0.05, 0.95]. If confidence ≤ 0.55 → HOLD.
+**Stage 4 — Regime-Thesis Interaction:**
+- Risk-off regime:
+  - Growth theses (AI, tech, crypto) → heavy dampen (0.4×) or kill if confidence < 0.7
+  - Defensive theses (utilities, healthcare, staples) → boost (1.3×)
+- Risk-on regime:
+  - All theses → normal processing (no adjustment)
+- Neutral regime:
+  - Slight preference for confirmed/developing over emerging (0.9× emerging)
 
-## 9. Risk Manager (risk/manager.py)
+**Final gates:**
+- Confidence clamped to [0.05, 0.95]  
+- If final confidence ≤ 0.60 → HOLD (higher threshold for thesis-driven system)
+- Thesis signals get lower threshold (0.55) than sentiment-only signals (0.65)
 
-**Position sizing:**
+**Enhanced output:**
+```python
+{
+    "signal": "BUY"|"SELL"|"HOLD",
+    "confidence": float,
+    "primary_source": "thesis"|"sentiment"|"technical",
+    "thesis_id": str,  # if thesis-driven
+    "lifecycle_stage": str,  # if thesis-driven  
+    "contributing_strategies": list,
+    "regime_adjustment": float,
+    "reasoning": str
+}
+```
+
+## 11. Enhanced Risk Manager (risk/manager.py)
+
+**Thesis-aware position sizing:**
 ```
 risk_budget   = equity × 0.02
-stop_distance = price × 0.03
+stop_distance = price × thesis_stop_factor   # thesis-aware stop distance
 base_shares   = risk_budget / stop_distance
-shares        = int(base_shares × confidence_factor × regime_factor × sector_factor)
+shares        = int(base_shares × confidence_factor × regime_factor × 
+                   sector_factor × lifecycle_factor)
 shares        = min(shares, 500)   # hard cap
 ```
-Where:
-- confidence_factor = max(0.5, min(1.0, confidence))
-- regime_factor = 0.75 if regime == "risk_off", else 1.0
-- sector_factor = 0.50 if sector_pct ≥ 0.20 (sector overweight threshold), else 1.0
 
-**Stop/TP placement:**
-- BUY: stop_loss = price × 0.97, take_profit = price × 1.03
-- SELL: stop_loss = price × 1.03, take_profit = price × 0.97
+**New factors:**
+- **lifecycle_factor**: 
+  - EMERGING: 0.5 (high risk, small size)
+  - DEVELOPING: 1.0 (normal size)
+  - CONFIRMED: 1.2 (institutional validation)
+  - CONSENSUS: 0.3 (exit mode)
+- **thesis_stop_factor**:
+  - Thesis trades: 0.05 (wider stops, theses take time)
+  - Sentiment trades: 0.03 (tighter stops, quicker moves)
 
-**7 hard rules checked in order:**
+**Enhanced Stop/TP placement:**
+- **Thesis-driven trades**: wider stops to account for thesis development time
+  - BUY: stop_loss = price × 0.95, take_profit = price × 1.06
+  - SELL: stop_loss = price × 1.05, take_profit = price × 0.94
+- **Sentiment-only trades**: tighter stops for quicker moves
+  - BUY: stop_loss = price × 0.97, take_profit = price × 1.03
+  - SELL: stop_loss = price × 1.03, take_profit = price × 0.97
+
+**Enhanced 7 hard rules:**
 1. price ≥ $5
-2. market_cap ≥ $1B (skip check if data unavailable — don't reject on missing data)
+2. market_cap ≥ $1B (skip check if data unavailable)
 3. len(open_positions) < 15 (exempt if ticker already held)
 4. cash > equity × 0.20 (BUY only)
 5. current_ticker_value < equity × 0.10
-6. sector_exposure < equity × 0.30
-7. no same-direction trade on same ticker within 2 hours (checks `trades` table)
+6. sector_exposure < equity × 0.30  
+7. **Enhanced duplicate trade check**: no same-direction trade on same ticker within:
+   - 2 hours for sentiment trades (quick moves)
+   - 4 hours for thesis trades (may need multiple entry opportunities)
 
-Sector lookup: `sector_cache` table → yfinance if miss → cache result.
+**Thesis-aware sector limits:**
+- Track sector exposure by thesis theme
+- Limit theme concentration: max 25% in any single thesis theme
+- Emergency thesis exit: if thesis expires mid-trade, exit within 2 cycles
 
-## 10. Executor (executor/alpaca.py)
+## 12. Executor (executor/alpaca.py)
 - Uses `TradingClient` with `paper=True`
 - Checks `client.get_clock().is_open` before every order
 - Submits `MarketOrderRequest` with `TimeInForce.DAY`
 - Returns dict with order_id, symbol, side, qty, status, filled_avg_price
 - On failure: returns `{error, ticker}`, no retry within cycle
 
-## 11. Feedback Loop
+## 13. Thesis-Aware Feedback Loop
 
-**feedback/logger.py** — log_trade(trade_data) → writes to `trades` table, returns UUID.
+**Enhanced feedback/logger.py** — log_trade(trade_data):
+- Writes to `trades` table with new fields:
+  - `thesis_id` (if thesis-driven trade)
+  - `lifecycle_stage` (EMERGING/DEVELOPING/CONFIRMED/CONSENSUS)
+  - `signal_attribution` (thesis vs sentiment vs technical)
+  - `materiality_level` (high/medium/low)
+- Returns UUID for outcome tracking
 
-**feedback/outcomes.py** — measure_outcomes():
-- Queries trades with no matching row in `outcomes` table
-- For each: fetch current price via yfinance
-- Exit conditions (first hit): stop_loss hit, take_profit hit, age ≥ 8 hours
-- WIN: return > +1%, LOSS: return < -1%, NEUTRAL: between
-- Writes to `outcomes` table, then calls update_weights()
+**Enhanced feedback/outcomes.py** — measure_outcomes():
+- **Dual measurement windows**:
+  - Sentiment trades: 8 hours (quick moves)
+  - Thesis trades: 3-5 days (theses take time to play out)
+- **Attribution tracking**: separate outcomes by signal source
+- Exit conditions (first hit):
+  - stop_loss hit, take_profit hit
+  - Age threshold (8hr sentiment / 120hr thesis)
+  - **Thesis expiry**: if thesis expires, force exit
+- WIN/LOSS/NEUTRAL same thresholds: ±1%
+- Enhanced outcomes table with thesis attribution
 
-**feedback/weights.py:**
+**Enhanced feedback/weights.py:**
 
-Weight update (EMA):
+**Multi-dimensional weight updates**:
+1. **Strategy weights** (existing): EMA update per strategy
+2. **Thesis theme weights**: Track performance by thesis theme (AI, earnings, regulatory, etc.)
+3. **Lifecycle stage weights**: Track performance by entry stage (EMERGING vs DEVELOPING vs CONFIRMED)
+4. **Materiality accuracy**: Track materiality_classifier prediction vs actual trade impact
+
+**Thesis-specific learning**:
 ```python
-target = 1.0 if WIN else 0.0
-new_weight = old_weight * 0.95 + target * 0.05
-new_weight = max(0.1, min(1.0, new_weight))
-```
-Updates: all strategies in strategies_fired + sentiment_source. NEUTRAL → no update.
+# Thesis theme weight update
+theme_target = 1.0 if WIN else 0.0
+new_theme_weight = old_theme_weight * 0.90 + theme_target * 0.10
 
-Circuit breaker:
-- Rolling 7-day win rate = WIN / (WIN + LOSS), excludes NEUTRAL
-- Trips if: win_rate < 0.40 AND trade_count ≥ 10 in window
-- On trip: writes to `circuit_breaker` table, sends Slack/email
-- Already tripped → skip re-trip check
-- Manual reset via dashboard
-
-## 12. Dashboard (dashboard/app.py)
-All data from Turso. Cache TTL: 30s for portfolio/positions, 60s for trades/weights.
-
-Tabs: Positions, Trade History, Performance, Signals & Regime, Discovery, Risk Controls, Settings.
-
-Key panels:
-- Portfolio KPIs: equity, cash (with % of portfolio), buying power, position count vs 15 max, unrealized P&L
-- Sector exposure: pie chart from sector_cache lookup on open positions
-- Learned weights: bar charts for strategy weights and source weights
-- Win rate chart: rolling daily win rate with 40% threshold line (red dashed)
-- Circuit breaker: status + manual reset button + 7-day win rate metric
-- Discovery panel: latest cycle_id, tickers discovered, source per ticker from discovery_log
-- Settings: current env vars, API key status (configured/not set)
+# Lifecycle timing weight update  
+lifecycle_target = 1.0 if WIN else 0.0
+lifecycle_weight = old_lifecycle_weight * 0.95 + lifecycle_target * 0.05
 ```
 
+│  │   stage         │  │   sentiment      │  │   (by theme)        │ │
+**Enhanced circuit breaker**:
+- Track separate win rates: thesis trades vs sentiment trades
 - Thesis circuit breaker: trips if thesis win rate < 0.35 over 14 days
 - Sentiment circuit breaker: trips if sentiment win rate < 0.40 over 7 days
 - **Materiality circuit breaker**: if high-materiality classification accuracy < 0.60, 
@@ -619,16 +887,20 @@ Updated Architecture:
 │  │  ┌─────────────────────┐         ┌─────────────────────────────┐ │ │
 │  │  │  HIGH MATERIALITY   │         │   MEDIUM/LOW MATERIALITY    │ │ │
 │  │  │                     │         │                             │ │ │
-│  │  │ FULL CLAUDE CALL:   │         │ BASIC ANALYSIS:             │ │ │
-│  │  │ • Thesis extraction │         │ • Simple ticker sentiment   │ │ │
-│  │  │ • Theme/mechanism   │         │ • Direction + confidence    │ │ │
-│  │  │ • Implied tickers   │         │ • Use pre-scored if avail   │ │ │
-│  │  │ • Direct sentiment  │         │   (Marketaux/Massive)       │ │ │
+│  │  │  delegates to →     │         │ BASIC ANALYSIS (in-module): │ │ │
+│  │  │ thesis_extractor.py │         │ • Simple ticker sentiment   │ │ │
+│  │  │ (FULL CLAUDE CALL): │         │ • Direction + confidence    │ │ │
+│  │  │ • Thesis statement  │         │ • Use pre-scored if avail   │ │ │
+│  │  │ • Theme/mechanism   │         │   (Marketaux/Massive)       │ │ │
+│  │  │ • Implied tickers   │         │ • Lightweight Haiku call    │ │ │
+│  │  │ • Direct sentiment  │         │   for newsapi/alpaca/polygon│ │ │
 │  │  │ • Time horizon      │         │                             │ │ │
 │  │  └─────────────────────┘         └─────────────────────────────┘ │ │
 │  │             │                                │                   │ │
 │  └─────────────┼────────────────────────────────┼───────────────────┘ │
 │                │                                │                     │
+│   thesis obj → thesis_lifecycle.py              │                     │
+│                │                    sentiment → sentiment_scores tbl  │
 └────────────────┼────────────────────────────────┼─────────────────────┘
                  │                                │
                  ▼                                │
