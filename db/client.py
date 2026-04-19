@@ -777,3 +777,490 @@ def get_recent_win_rate(days: int = 7) -> float:
         if total and total > 0:
             return wins / total if wins else 0.0
     return 0.0
+
+
+# ============================================================================
+# THESIS MANAGEMENT UTILITIES
+# ============================================================================
+
+
+def create_thesis(
+    thesis_statement: str,
+    theme: str,
+    direction: str,
+    tickers: List[str],
+    time_horizon: str,
+    confidence_score: float,
+    conviction_score: float,
+    mechanism: Optional[str] = None,
+    sectors: Optional[List[str]] = None,
+) -> str:
+    """
+    Create a new investment thesis.
+
+    Args:
+        thesis_statement: Human-readable investment thesis
+        theme: Category like "earnings", "merger", "regulatory", etc.
+        direction: "bullish" or "bearish"
+        tickers: List of ticker symbols implicated in thesis
+        time_horizon: "intraday", "short_term", "medium_term", "long_term"
+        confidence_score: Claude's confidence in thesis extraction (0.0-1.0)
+        conviction_score: Initial evidence strength (0.0-1.0)
+        mechanism: Optional description of how thesis should play out
+        sectors: Optional list of GICS sectors
+
+    Returns:
+        Thesis ID (UUID string)
+    """
+    import uuid
+
+    db = get_db()
+    thesis_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat() + "Z"
+
+    db.execute(
+        """
+        INSERT INTO active_theses (
+            id, thesis_statement, theme, direction, mechanism,
+            lifecycle_stage, confidence_score, conviction_score,
+            tickers, sectors, time_horizon, created_at, last_updated,
+            thesis_history, evidence_count, source_diversity
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            thesis_id, thesis_statement, theme, direction, mechanism,
+            "emerging", confidence_score, conviction_score,
+            json.dumps(tickers), json.dumps(sectors or []), time_horizon,
+            now, now, json.dumps([thesis_statement]), 0, 0
+        ]
+    )
+
+    logger.info(f"Created thesis {thesis_id}: {theme} - {direction}")
+    return thesis_id
+
+
+def get_active_theses(
+    exclude_expired: bool = True,
+    lifecycle_stages: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Get active investment theses.
+
+    Args:
+        exclude_expired: If True, exclude expired theses
+        lifecycle_stages: Optional filter by specific stages
+
+    Returns:
+        List of thesis dictionaries with tickers and sectors as parsed lists
+    """
+    db = get_db()
+
+    where_conditions = []
+    params = []
+
+    if exclude_expired:
+        where_conditions.append("lifecycle_stage != 'expired'")
+
+    if lifecycle_stages:
+        where_conditions.append(f"lifecycle_stage IN ({','.join(['?'] * len(lifecycle_stages))})")
+        params.extend(lifecycle_stages)
+
+    where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+
+    result = db.execute(
+        f"""
+        SELECT id, thesis_statement, theme, direction, mechanism,
+               lifecycle_stage, confidence_score, conviction_score,
+               tickers, sectors, time_horizon, created_at, last_updated,
+               expires_at, thesis_history, evidence_count, source_diversity
+        FROM active_theses
+        {where_clause}
+        ORDER BY last_updated DESC
+        """,
+        params
+    )
+
+    theses = []
+    for row in result.rows:
+        thesis = {
+            "id": row[0],
+            "thesis_statement": row[1],
+            "theme": row[2],
+            "direction": row[3],
+            "mechanism": row[4],
+            "lifecycle_stage": row[5],
+            "confidence_score": row[6],
+            "conviction_score": row[7],
+            "tickers": json.loads(row[8]) if row[8] else [],
+            "sectors": json.loads(row[9]) if row[9] else [],
+            "time_horizon": row[10],
+            "created_at": row[11],
+            "last_updated": row[12],
+            "expires_at": row[13],
+            "thesis_history": json.loads(row[14]) if row[14] else [],
+            "evidence_count": row[15],
+            "source_diversity": row[16],
+        }
+        theses.append(thesis)
+
+    return theses
+
+
+def get_thesis_by_id(thesis_id: str) -> Optional[Dict[str, Any]]:
+    """Get a specific thesis by ID."""
+    theses = get_active_theses(exclude_expired=False)
+    for thesis in theses:
+        if thesis["id"] == thesis_id:
+            return thesis
+    return None
+
+
+def find_similar_theses(
+    tickers: List[str],
+    theme: Optional[str] = None,
+    direction: Optional[str] = None,
+    min_ticker_overlap: int = 1
+) -> List[Dict[str, Any]]:
+    """
+    Find active theses with overlapping tickers or matching themes.
+
+    Args:
+        tickers: Ticker list to match against
+        theme: Optional theme filter
+        direction: Optional direction filter
+        min_ticker_overlap: Minimum number of overlapping tickers
+
+    Returns:
+        List of matching theses, sorted by overlap score descending
+    """
+    active_theses = get_active_theses(exclude_expired=True)
+    ticker_set = set(t.upper() for t in tickers)
+
+    matches = []
+    for thesis in active_theses:
+        thesis_tickers = set(t.upper() for t in thesis["tickers"])
+        overlap = len(ticker_set & thesis_tickers)
+
+        # Skip if insufficient ticker overlap
+        if overlap < min_ticker_overlap:
+            continue
+
+        # Apply optional filters
+        if theme and thesis["theme"] != theme:
+            continue
+        if direction and thesis["direction"] != direction:
+            continue
+
+        thesis["overlap_score"] = overlap
+        thesis["overlap_tickers"] = list(ticker_set & thesis_tickers)
+        matches.append(thesis)
+
+    # Sort by overlap score (descending), then by conviction
+    matches.sort(key=lambda x: (x["overlap_score"], x["conviction_score"]), reverse=True)
+    return matches
+
+
+def update_thesis_conviction(
+    thesis_id: str,
+    conviction_delta: float,
+    new_lifecycle_stage: Optional[str] = None
+) -> bool:
+    """
+    Update thesis conviction score and optionally lifecycle stage.
+
+    Args:
+        thesis_id: Thesis to update
+        conviction_delta: Change in conviction (-1.0 to +1.0)
+        new_lifecycle_stage: Optional new lifecycle stage
+
+    Returns:
+        True if thesis was found and updated
+    """
+    db = get_db()
+    now = datetime.utcnow().isoformat() + "Z"
+
+    # Get current thesis
+    current = get_thesis_by_id(thesis_id)
+    if not current:
+        return False
+
+    new_conviction = max(0.0, min(1.0, current["conviction_score"] + conviction_delta))
+
+    updates = ["conviction_score = ?", "last_updated = ?"]
+    params = [new_conviction, now]
+
+    if new_lifecycle_stage:
+        updates.append("lifecycle_stage = ?")
+        params.append(new_lifecycle_stage)
+
+    params.append(thesis_id)
+
+    db.execute(
+        f"UPDATE active_theses SET {', '.join(updates)} WHERE id = ?",
+        params
+    )
+
+    logger.debug(f"Updated thesis {thesis_id}: conviction {current['conviction_score']:.3f} -> {new_conviction:.3f}")
+    return True
+
+
+def expire_stale_theses(max_age_hours: int = 120) -> int:
+    """
+    Mark theses as expired if they haven't been updated recently.
+
+    Args:
+        max_age_hours: Theses older than this are expired
+
+    Returns:
+        Number of theses expired
+    """
+    db = get_db()
+    now = datetime.utcnow().isoformat() + "Z"
+
+    result = db.execute(
+        """
+        UPDATE active_theses
+        SET lifecycle_stage = 'expired', expires_at = ?
+        WHERE lifecycle_stage != 'expired'
+        AND last_updated < datetime('now', '-' || ? || ' hours')
+        """,
+        [now, max_age_hours]
+    )
+
+    expired_count = result.rows_affected
+    if expired_count > 0:
+        logger.info(f"Expired {expired_count} stale theses (older than {max_age_hours}h)")
+
+    return expired_count
+
+
+# ============================================================================
+# THESIS EVIDENCE UTILITIES
+# ============================================================================
+
+
+def add_thesis_evidence(
+    thesis_id: str,
+    article_url: str,
+    source: str,
+    published_at: str,
+    added_conviction: float,
+    materiality: str,
+    reasoning: Optional[str] = None
+) -> bool:
+    """
+    Add supporting evidence to a thesis.
+
+    Args:
+        thesis_id: Target thesis ID
+        article_url: Source article URL
+        source: News source name
+        published_at: Article publication timestamp (ISO 8601)
+        added_conviction: Conviction change from this evidence (-1.0 to +1.0)
+        materiality: "high", "medium", or "low"
+        reasoning: Optional Claude reasoning for conviction change
+
+    Returns:
+        True if evidence was added successfully
+    """
+    db = get_db()
+    now = datetime.utcnow().isoformat() + "Z"
+
+    # Check if evidence already exists for this article
+    existing = db.execute(
+        "SELECT id FROM thesis_evidence WHERE thesis_id = ? AND article_url = ?",
+        [thesis_id, article_url]
+    )
+    if existing.rows:
+        logger.debug(f"Evidence already exists for {article_url} on thesis {thesis_id}")
+        return False
+
+    # Add evidence
+    db.execute(
+        """
+        INSERT INTO thesis_evidence (
+            thesis_id, article_url, source, published_at,
+            added_conviction, reasoning, materiality, added_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [thesis_id, article_url, source, published_at,
+         added_conviction, reasoning, materiality, now]
+    )
+
+    # Update thesis evidence count and source diversity
+    db.execute(
+        """
+        UPDATE active_theses SET
+            evidence_count = (
+                SELECT COUNT(*) FROM thesis_evidence WHERE thesis_id = ?
+            ),
+            source_diversity = (
+                SELECT COUNT(DISTINCT source) FROM thesis_evidence WHERE thesis_id = ?
+            )
+        WHERE id = ?
+        """,
+        [thesis_id, thesis_id, thesis_id]
+    )
+
+    logger.debug(f"Added evidence to thesis {thesis_id} from {source} (conviction: {added_conviction:+.2f})")
+    return True
+
+
+def get_thesis_evidence(
+    thesis_id: str,
+    limit: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """
+    Get evidence supporting a thesis.
+
+    Args:
+        thesis_id: Target thesis ID
+        limit: Optional limit on number of results
+
+    Returns:
+        List of evidence records, newest first
+    """
+    db = get_db()
+
+    limit_clause = f"LIMIT {limit}" if limit else ""
+
+    result = db.execute(
+        f"""
+        SELECT id, thesis_id, article_url, source, published_at,
+               added_conviction, reasoning, materiality, added_at
+        FROM thesis_evidence
+        WHERE thesis_id = ?
+        ORDER BY added_at DESC
+        {limit_clause}
+        """,
+        [thesis_id]
+    )
+
+    evidence = []
+    for row in result.rows:
+        evidence.append({
+            "id": row[0],
+            "thesis_id": row[1],
+            "article_url": row[2],
+            "source": row[3],
+            "published_at": row[4],
+            "added_conviction": row[5],
+            "reasoning": row[6],
+            "materiality": row[7],
+            "added_at": row[8],
+        })
+
+    return evidence
+
+
+# ============================================================================
+# SENTIMENT SCORES UTILITIES
+# ============================================================================
+
+
+def save_sentiment_scores(
+    scores: List[Dict[str, Any]]
+) -> int:
+    """
+    Save sentiment scores for non-thesis articles.
+
+    Args:
+        scores: List of sentiment score dicts with keys:
+               ticker, sentiment_score, urgency, materiality, reasoning,
+               source, article_url (optional)
+
+    Returns:
+        Number of scores saved
+    """
+    if not scores:
+        return 0
+
+    db = get_db()
+    now = datetime.utcnow().isoformat() + "Z"
+
+    saved_count = 0
+    for score in scores:
+        try:
+            db.execute(
+                """
+                INSERT INTO sentiment_scores (
+                    ticker, article_url, sentiment_score, urgency,
+                    materiality, reasoning, source, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    score["ticker"],
+                    score.get("article_url"),
+                    score["sentiment_score"],
+                    score.get("urgency"),
+                    score["materiality"],
+                    score.get("reasoning"),
+                    score["source"],
+                    now
+                ]
+            )
+            saved_count += 1
+        except Exception as e:
+            logger.warning(f"Failed to save sentiment score for {score.get('ticker')}: {e}")
+
+    logger.debug(f"Saved {saved_count}/{len(scores)} sentiment scores")
+    return saved_count
+
+
+def get_sentiment_for_ticker(
+    ticker: str,
+    hours_back: int = 24,
+    include_article_urls: bool = False
+) -> List[Dict[str, Any]]:
+    """
+    Get recent sentiment scores for a ticker.
+
+    Args:
+        ticker: Target ticker symbol
+        hours_back: How far back to look for scores
+        include_article_urls: Whether to include article URLs in results
+
+    Returns:
+        List of sentiment records, newest first
+    """
+    db = get_db()
+
+    fields = "ticker, sentiment_score, urgency, materiality, reasoning, source, recorded_at"
+    if include_article_urls:
+        fields = "ticker, article_url, sentiment_score, urgency, materiality, reasoning, source, recorded_at"
+
+    result = db.execute(
+        f"""
+        SELECT {fields}
+        FROM sentiment_scores
+        WHERE ticker = ? AND recorded_at >= datetime('now', '-' || ? || ' hours')
+        ORDER BY recorded_at DESC
+        """,
+        [ticker.upper(), hours_back]
+    )
+
+    scores = []
+    for row in result.rows:
+        if include_article_urls:
+            scores.append({
+                "ticker": row[0],
+                "article_url": row[1],
+                "sentiment_score": row[2],
+                "urgency": row[3],
+                "materiality": row[4],
+                "reasoning": row[5],
+                "source": row[6],
+                "recorded_at": row[7],
+            })
+        else:
+            scores.append({
+                "ticker": row[0],
+                "sentiment_score": row[1],
+                "urgency": row[2],
+                "materiality": row[3],
+                "reasoning": row[4],
+                "source": row[5],
+                "recorded_at": row[6],
+            })
+
+    return scores

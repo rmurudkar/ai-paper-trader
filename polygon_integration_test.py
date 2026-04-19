@@ -6,7 +6,8 @@ NOTE: Polygon free tier is rate-limited to 5 requests/minute.
       polygon.py sleeps 12s between per-ticker requests inside _fetch_general_news.
       This test suite takes ~3-4 minutes to run in full.
 
-Run: python test_polygon.py
+This is a STANDALONE integration test script (not part of pytest suite).
+Run: python polygon_integration_test.py
 """
 
 import os

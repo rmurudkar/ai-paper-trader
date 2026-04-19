@@ -2,7 +2,8 @@
 Integration tests for fetchers/newsapi.py — hits the real NewsAPI.ai API.
 Requires NEWSAPI_AI_KEY in .env
 
-Run: python test_newsapi.py
+This is a STANDALONE integration test script (not part of pytest suite).
+Run: python newsapi_integration_test.py
 """
 
 import os

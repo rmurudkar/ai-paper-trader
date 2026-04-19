@@ -493,11 +493,11 @@ Updated Architecture:
                       │
                       ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         DISCOVERY.PY                               │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐ │
-│  │   News Mentions │  │   Market Movers │  │  Active Theses      │ │
-│  │   (regex/Groq)  │  │   (S&P gainers) │  │  (implied tickers)  │ │
-│  └─────────────────┘  └─────────────────┘  └─────────────────────┘ │
+│                         DISCOVERY.PY                                │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐  │
+│  │   News Mentions │  │   Market Movers │  │  Active Theses      │  │
+│  │   (regex/Groq)  │  │   (S&P gainers) │  │  (implied tickers)  │  │
+│  └─────────────────┘  └─────────────────┘  └─────────────────────┘  │
 │             │                   │                   ▲               │
 │             └───────────────────┼───────────────────┘               │
 │                                 ▼                                   │
@@ -511,9 +511,9 @@ Updated Architecture:
 ┌─────────────────────────────────────────────────────────────────────┐
 │                      NEWS PIPELINE                                  │
 │                                                                     │
-│  marketaux.py  massive.py  newsapi.py  alpaca_news.py  polygon.py  │
-│      │             │           │            │            │         │
-│      └─────────────┼───────────┼────────────┼────────────┘         │
+│  marketaux.py  massive.py  newsapi.py  alpaca_news.py  polygon.py   │
+│      │             │           │            │            │          │
+│      └─────────────┼───────────┼────────────┼────────────┘          │
 │                    ▼           ▼            ▼                       │
 │              ┌─────────────────────────────────────┐                │
 │              │         AGGREGATOR.PY               │                │
@@ -523,20 +523,20 @@ Updated Architecture:
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                  MATERIALITY FILTER (NEW)                          │
+│                  MATERIALITY FILTER (NEW)                           │
 │                                                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │              materiality_classifier.py                         │ │
-│  │                                                                 │ │
-│  │  Stage 1: RULES-BASED HIGH DETECTION                           │ │
-│  │  ┌─────────────────────────────────────────────────────────────┐ │ │
-│  │  │ Keywords: earnings, guidance, CEO, merger, FDA, regulatory  │ │ │
-│  │  │ Multi-ticker: >= 3 tickers → medium                        │ │ │
-│  │  │ Title patterns: "announces", "reports", "files"            │ │ │
-│  │  └─────────────────────────────────────────────────────────────┘ │ │
-│  │                              │                                  │ │
-│  │  Stage 2: SOURCE-BASED BOOST │                                  │ │
-│  │  ┌─────────────────────────────▼─────────────────────────────────┐ │ │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │              materiality_classifier.py                          ││
+│  │                                                                 ││
+│  │  Stage 1: RULES-BASED HIGH DETECTION                            ││
+│  │  ┌─────────────────────────────────────────────────────────────┐││
+│  │  │ Keywords: earnings, guidance, CEO, merger, FDA, regulatory  │││
+│  │  │ Multi-ticker: >= 3 tickers → medium                        │ ││
+│  │  │ Title patterns: "announces", "reports", "files"            │ ││
+│  │  └─────────────────────────────────────────────────────────────┘││
+│  │                              │                                  ││
+│  │  Stage 2: SOURCE-BASED BOOST │                                  ││
+│  │  ┌─────────────────────────────▼─────────────────────────────── ││
 │  │  │ Premium sources: WSJ, Bloomberg, Reuters → upgrade to medium│ │ │
 │  │  │ Pre-scored: Marketaux, Massive → medium                    │ │ │
 │  │  │ Institutional: Alpaca/Benzinga, Polygon → high             │ │ │

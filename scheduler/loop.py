@@ -180,42 +180,29 @@ def run_trading_cycle(is_premarket: bool = False) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"Cycle {cycle_id}: Article dedup failed, processing all articles: {e}")
 
-    # ── 5. Sentiment analysis ──────────────────────────────────────────
+    # ── 5. Materiality classification ──────────────────────────────────
+    # Tags each article high / medium / low so downstream analysis.py can
+    # route high-materiality items to the full thesis-extraction Claude call
+    # and skip expensive analysis on the rest.
     t0 = time.monotonic()
-    sentiment_results = []
     ticker_sentiments: Dict[str, Dict] = {}
     try:
-        # TODO: Replace with thesis-driven analysis.py
-        # from engine.sentiment import batch_analyze_articles, batch_record_sentiments
-        pass
         if articles:
-            sentiment_results = batch_analyze_articles(articles)
-
-            # Promote tickers inferred by sector/macro Claude analysis that
-            # weren't found by discovery (e.g. oil crash → DAL, UAL).
-            # Must happen before market data fetch so they get price data too.
-            sector_additions = _collect_sector_macro_tickers(
-                sentiment_results, tickers, cycle_id
-            )
-            if sector_additions:
-                tickers = tickers + sector_additions
-                sources.update({t: ["sector_macro"] for t in sector_additions})
-                result["tickers_discovered"] = len(tickers)
-                logger.info(
-                    f"Cycle {cycle_id}: Promoted {len(sector_additions)} sector_macro tickers "
-                    f"into active set: {sector_additions}"
-                )
-
-            ticker_sentiments = batch_record_sentiments(tickers, sentiment_results)
+            from engine.materiality_classifier import classify_articles
+            articles = classify_articles(articles)
+            high = sum(1 for a in articles if a.get("materiality") == "high")
+            medium = sum(1 for a in articles if a.get("materiality") == "medium")
+            low = sum(1 for a in articles if a.get("materiality") == "low")
             logger.info(
-                f"Cycle {cycle_id}: Sentiment analysis produced "
-                f"{len(sentiment_results)} results for {len(ticker_sentiments)} tickers"
+                f"Cycle {cycle_id}: Materiality — "
+                f"{high} high, {medium} medium, {low} low "
+                f"({len(articles)} articles)"
             )
     except Exception as e:
-        msg = f"Sentiment analysis failed: {e}"
+        msg = f"Materiality classification failed: {e}"
         logger.error(f"Cycle {cycle_id}: {msg}\n{traceback.format_exc()}")
         errors.append(msg)
-    phase_timings["sentiment"] = int((time.monotonic() - t0) * 1000)
+    phase_timings["materiality"] = int((time.monotonic() - t0) * 1000)
 
     # ── 6. Market data ─────────────────────────────────────────────────
     # tickers may have grown via sector_macro — fetch covers all of them.
