@@ -17,9 +17,11 @@ analysis pipeline:
 
     Stage 2  Source-based boost
              Pre-scored sources (marketaux, massive) floor at medium.
-             Institutional feeds (alpaca/benzinga, polygon) can reach high.
+             Institutional feeds (alpaca/benzinga, polygon) floor at high
+             (professional grade).
              Paywalled/premium outlets (WSJ, Bloomberg, Reuters) floor at
              medium even when only a snippet is available.
+             Low-quality sources are downgraded by one level.
 
     Stage 3  Claude refinement (edge cases only)
              Runs *only* when stages 1+2 leave the article ambiguous
@@ -146,8 +148,8 @@ def stage1_rules_based(article: Dict) -> Tuple[str, float, List[str]]:
 # Stage 2 — source-based boost
 # ---------------------------------------------------------------------------
 
-# Institutional / licensed feeds: full-text, curated. Safe to floor at medium
-# and promote to high when Stage 1 already hints at a catalyst.
+# Institutional / licensed feeds: full-text, curated, professional grade.
+# Per spec, every article from these feeds is floored at "high" materiality.
 INSTITUTIONAL_SOURCES = {"alpaca", "polygon"}
 
 # Pre-scored aggregators: trusted sentiment, but the bodies themselves tend
@@ -161,6 +163,23 @@ PREMIUM_DOMAINS = (
     "wsj.com", "ft.com", "bloomberg.com", "nytimes.com",
     "reuters.com", "barrons.com", "marketwatch.com",
 )
+
+# Low-reputation feeds whose articles should be downgraded one level.
+# Populate with identifiers that appear in article["source"] (lowercased).
+# Intentionally empty by default — add entries as low-quality sources are
+# identified in production traffic.
+LOW_QUALITY_SOURCES: set = set()
+
+# One-step downgrade mapping used when an article comes from a low-quality
+# source. "unknown" maps to "low" because it represents an article that
+# Stage 1 could not find any signal for — a low-quality variant of the same
+# is clearly low materiality.
+_DOWNGRADE_ONE_LEVEL = {
+    "high": "medium",
+    "medium": "low",
+    "low": "low",
+    "unknown": "low",
+}
 
 _MATERIALITY_RANK = {"low": 0, "unknown": 0, "medium": 1, "high": 2}
 
@@ -187,8 +206,10 @@ def stage2_source_boost(
 ) -> Tuple[str, float, List[str]]:
     """Stage 2: adjust Stage 1's verdict based on source credibility.
 
-    - Institutional feeds (alpaca, polygon) + Stage 1 medium → promote to high
-    - Institutional / pre-scored / premium-domain → floor at medium
+    - Institutional feeds (alpaca, polygon) → floor at high (professional grade)
+    - Pre-scored aggregators (marketaux, massive) → floor at medium
+    - Premium paywalled outlets (WSJ, Bloomberg, Reuters, ...) → floor at medium
+    - Low-quality sources → downgrade by one level
     - Otherwise leave unchanged (Stage 1 result flows through)
     """
     source = (article.get("source") or "").lower()
@@ -198,17 +219,18 @@ def stage2_source_boost(
     confidence = stage1_confidence
 
     if source in INSTITUTIONAL_SOURCES:
-        # Promote medium → high when an institutional feed carries a
-        # corporate-activity pattern.
-        if materiality == "medium":
-            materiality = "high"
-            confidence = max(confidence, 0.75)
+        # Spec: institutional feeds are professional grade → floor at high.
+        promoted = _max_materiality(materiality, "high")
+        if promoted != materiality:
+            materiality = promoted
+            # Tighter confidence when Stage 1 already said medium (pattern +
+            # institutional source is a strong combo). Looser when Stage 1
+            # was unknown (we're promoting on source alone).
+            confidence = max(
+                confidence,
+                0.75 if stage1_materiality == "medium" else 0.70,
+            )
             signals.append(f"source_promote:{source}")
-        else:
-            materiality = _max_materiality(materiality, "medium")
-            if materiality == "medium" and stage1_materiality != "medium":
-                confidence = max(confidence, 0.55)
-                signals.append(f"source_floor:{source}")
 
     elif source in PRE_SCORED_SOURCES:
         materiality = _max_materiality(materiality, "medium")
@@ -222,6 +244,15 @@ def stage2_source_boost(
             confidence = max(confidence, 0.55)
             signals.append("source_floor:premium_domain")
 
+    elif source in LOW_QUALITY_SOURCES:
+        # Spec: low-quality sources → downgrade one level.
+        downgraded = _DOWNGRADE_ONE_LEVEL.get(materiality, "low")
+        if downgraded != materiality:
+            materiality = downgraded
+            # Cap confidence since we're overriding Stage 1 on source alone.
+            confidence = min(confidence, 0.5) if confidence > 0 else 0.5
+            signals.append(f"source_downgrade:{source}")
+
     return materiality, confidence, signals
 
 
@@ -230,8 +261,8 @@ def stage2_source_boost(
 # ---------------------------------------------------------------------------
 
 CLAUDE_MODEL = "claude-3-haiku-20240307"
-CLAUDE_MAX_TOKENS = 80
-CLAUDE_TEMPERATURE = 0.0
+CLAUDE_MAX_TOKENS = 100
+CLAUDE_TEMPERATURE = 0.1
 WORD_LIMIT = 1200  # aligns with CLAUDE.md hard rule
 
 _CLAUDE_PROMPT = (

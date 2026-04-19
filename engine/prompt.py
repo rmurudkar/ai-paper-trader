@@ -8,19 +8,31 @@ engine/combiner.py) can act on.
 
 What the prompt extracts
 ------------------------
-1. Thesis statement — a crisp, actionable sentence a PM could trade on.
-2. Theme            — short category ("earnings_beat", "merger", …).
-3. Mechanism        — how the thesis translates into price movement.
-4. Implied tickers  — primary, secondary, peers, suppliers/customers,
-                      beneficiaries/victims — not just those named in the
-                      headline.
-5. Direct sentiment — per-ticker score in [-1, +1] with reasoning.
-6. Sectors          — GICS sectors the thesis touches.
-7. Time horizon     — when the thesis should play out in price.
-8. Lifecycle hint   — Claude's single-article guess at whether this reads
-                      like a first report (emerging) or an already-priced-in
-                      consensus piece. The thesis_lifecycle module may
-                      override this using accumulated cross-article evidence.
+Per the CLAUDE.md "thesis output" shape (section 6, high-materiality track),
+parse_analysis_response returns a FLAT dict with these primary fields:
+
+    thesis_statement, theme, direction, mechanism, implied_tickers,
+    time_horizon, confidence, reasoning
+
+`implied_tickers` is a list of ticker symbols Claude flagged as secondary
+(peer, supplier, customer, competitor, beneficiary, victim) — the tickers
+a careful analyst would add beyond those named in the article.
+
+Additional supporting fields also emitted (used by downstream modules):
+  - ticker_analysis : rich per-ticker sentiment objects (symbol, role,
+                      sentiment_score, reasoning). Feeds the sentiment_scores
+                      table for direct per-ticker sentiment.
+  - sectors         : GICS sectors touched (feeds active_theses.sectors).
+  - urgency         : breaking / developing / standard (sentiment output).
+  - materiality     : Claude's re-check of the upstream classification.
+  - lifecycle_hint  : emerging / developing / confirmed / consensus — a
+                      single-article guess. thesis_lifecycle.py may override.
+  - novelty_reasoning : 1-sentence justification of lifecycle_hint.
+  - skip / skip_reason : defensive pathway when no thesis is present.
+
+Note: `published_at` and `source` are NOT produced by the prompt — they are
+article metadata that thesis_extractor.py / analysis.py stamp onto the
+returned object before storage.
 
 Design notes
 ------------
@@ -179,18 +191,17 @@ Respond with exactly ONE JSON object matching this shape:
   "skip": false,
   "skip_reason": null,
 
-  "thesis": {
-    "statement": "1-2 sentence thesis, present tense",
-    "theme": "short category token, e.g. earnings_beat | earnings_miss | guidance_cut | guidance_raise | merger | acquisition | regulatory_approval | regulatory_rejection | litigation | leadership_change | product_launch | product_recall | macro_rates | macro_inflation | geopolitical | supply_shock | secular_ai | secular_ev | sector_rotation",
-    "direction": "bullish | bearish | neutral",
-    "mechanism": "1 sentence: the causal path from catalyst to price movement",
-    "confidence": 0.0,
-    "time_horizon": "intraday | short_term | medium_term | long_term",
-    "lifecycle_hint": "emerging | developing | confirmed | consensus",
-    "novelty_reasoning": "1 sentence justifying the lifecycle_hint from article language"
-  },
+  "thesis_statement": "1-2 sentence thesis, present tense",
+  "theme": "short category token, e.g. earnings_beat | earnings_miss | guidance_cut | guidance_raise | merger | acquisition | regulatory_approval | regulatory_rejection | litigation | leadership_change | product_launch | product_recall | macro_rates | macro_inflation | geopolitical | supply_shock | secular_ai | secular_ev | sector_rotation",
+  "direction": "bullish | bearish | neutral",
+  "mechanism": "1 sentence: the causal path from catalyst to price movement",
+  "time_horizon": "intraday | short_term | medium_term | long_term",
+  "confidence": 0.0,
 
-  "tickers": [
+  "lifecycle_hint": "emerging | developing | confirmed | consensus",
+  "novelty_reasoning": "1 sentence justifying the lifecycle_hint from article language",
+
+  "ticker_analysis": [
     {
       "symbol": "UPPERCASE US-exchange ticker",
       "role": "primary | secondary | peer | supplier | customer | competitor | beneficiary | victim",
@@ -209,6 +220,9 @@ Respond with exactly ONE JSON object matching this shape:
 
 FIELD NOTES
 -----------
+- All thesis fields (thesis_statement, theme, direction, mechanism,
+  time_horizon, confidence) are at the TOP level of the JSON object. Do
+  NOT nest them under a "thesis" key.
 - time_horizon mapping:
     intraday     resolves by end of trading day
     short_term   days to a week (earnings reactions, guidance moves)
@@ -221,8 +235,12 @@ FIELD NOTES
 - materiality:
     Re-confirm the upstream classifier's call. If you disagree, use your
     own read — you are the more careful reader. Stay within high/medium/low.
-- "tickers" may be empty if the article is macro-only. In that case the
-  thesis still has value via the "sectors" field.
+- ticker_analysis:
+    Include every ticker the article implicates, primary and secondary.
+    The trading system will use `role` to separate implied (non-primary)
+    tickers from those directly named in the article.
+    May be empty if the article is macro-only; in that case the thesis
+    still has value via `sectors`.
 - JSON only. No markdown fences. No commentary.
 """
 
@@ -404,10 +422,26 @@ def _normalize_ticker_entry(raw: Dict) -> Optional[Dict]:
 def parse_analysis_response(raw_text: str) -> Dict:
     """Parse Claude's analysis response into a validated, normalized dict.
 
+    Output shape matches the CLAUDE.md "thesis output" spec (section 6) with
+    thesis fields flat at top level, plus supporting fields that downstream
+    modules need. Specifically:
+
+        thesis_statement, theme, direction, mechanism, implied_tickers,
+        time_horizon, confidence, reasoning         (the spec fields)
+
+        ticker_analysis, sectors, urgency, materiality, lifecycle_hint,
+        novelty_reasoning, skip, skip_reason        (supporting fields)
+
+    `implied_tickers` is derived from `ticker_analysis`: it contains the
+    symbols whose role != "primary" (i.e. Claude-flagged secondary names).
+
     Clamps sentiment to [-1, 1] and confidence to [0, 1]. Normalizes all
-    enum fields to their valid values (or a sensible default). Filters out
-    malformed ticker entries. Preserves the skip pathway so analysis.py
-    can record "analyzed but no thesis" outcomes.
+    enum fields. Filters malformed ticker entries. Preserves the skip
+    pathway so analysis.py can record "analyzed but no thesis" outcomes.
+
+    Backward-compatibility: also accepts responses that (incorrectly) nest
+    thesis fields under a "thesis" key, in case Claude falls back to the
+    older shape.
 
     Raises:
         AnalysisParseError: if the response is not valid JSON or is missing
@@ -431,34 +465,38 @@ def parse_analysis_response(raw_text: str) -> Dict:
     if skip_reason is not None and not isinstance(skip_reason, str):
         skip_reason = str(skip_reason)
 
-    thesis_raw = data.get("thesis") or {}
-    if not isinstance(thesis_raw, dict):
-        thesis_raw = {}
+    # Back-compat: if Claude nests thesis fields under "thesis", lift them.
+    nested = data.get("thesis")
+    if isinstance(nested, dict):
+        for k, v in nested.items():
+            data.setdefault(k, v)
 
     try:
-        thesis_confidence = float(thesis_raw.get("confidence", 0.0))
+        confidence = float(data.get("confidence", 0.0))
     except (TypeError, ValueError):
-        thesis_confidence = 0.0
+        confidence = 0.0
+    confidence = round(_clamp(confidence, 0.0, 1.0), 3)
 
-    thesis = {
-        "statement": (thesis_raw.get("statement") or "").strip(),
-        "theme": (thesis_raw.get("theme") or "").strip().lower().replace(" ", "_"),
-        "direction": _normalize_enum(thesis_raw.get("direction"), VALID_DIRECTIONS, "neutral"),
-        "mechanism": (thesis_raw.get("mechanism") or "").strip(),
-        "confidence": round(_clamp(thesis_confidence, 0.0, 1.0), 3),
-        "time_horizon": _normalize_enum(
-            thesis_raw.get("time_horizon"), VALID_TIME_HORIZONS, "short_term"
-        ),
-        "lifecycle_hint": _normalize_enum(
-            thesis_raw.get("lifecycle_hint"), VALID_LIFECYCLE_HINTS, "emerging"
-        ),
-        "novelty_reasoning": (thesis_raw.get("novelty_reasoning") or "").strip(),
-    }
+    thesis_statement = (data.get("thesis_statement") or data.get("statement") or "").strip()
+    theme = (data.get("theme") or "").strip().lower().replace(" ", "_")
+    direction = _normalize_enum(data.get("direction"), VALID_DIRECTIONS, "neutral")
+    mechanism = (data.get("mechanism") or "").strip()
+    time_horizon = _normalize_enum(
+        data.get("time_horizon"), VALID_TIME_HORIZONS, "short_term"
+    )
+    lifecycle_hint = _normalize_enum(
+        data.get("lifecycle_hint"), VALID_LIFECYCLE_HINTS, "emerging"
+    )
+    novelty_reasoning = (data.get("novelty_reasoning") or "").strip()
 
-    tickers_raw = data.get("tickers") or []
+    # Ticker analysis: accept "ticker_analysis" (new) or legacy "tickers".
+    tickers_raw = data.get("ticker_analysis")
+    if tickers_raw is None:
+        tickers_raw = data.get("tickers") or []
     if not isinstance(tickers_raw, list):
         tickers_raw = []
-    tickers: List[Dict] = []
+
+    ticker_analysis: List[Dict] = []
     seen_symbols = set()
     for entry in tickers_raw:
         if not isinstance(entry, dict):
@@ -469,7 +507,11 @@ def parse_analysis_response(raw_text: str) -> Dict:
         if normalized["symbol"] in seen_symbols:
             continue
         seen_symbols.add(normalized["symbol"])
-        tickers.append(normalized)
+        ticker_analysis.append(normalized)
+
+    # Derive implied_tickers per spec: secondary names Claude flagged beyond
+    # the primary tickers. Role "primary" is explicitly excluded.
+    implied_tickers = [t["symbol"] for t in ticker_analysis if t["role"] != "primary"]
 
     sectors_raw = data.get("sectors") or []
     if not isinstance(sectors_raw, list):
@@ -481,13 +523,16 @@ def parse_analysis_response(raw_text: str) -> Dict:
     reasoning = (data.get("reasoning") or "").strip()
 
     if skip:
-        thesis = {
-            "statement": "", "theme": "", "direction": "neutral",
-            "mechanism": "", "confidence": 0.0,
-            "time_horizon": "short_term", "lifecycle_hint": "emerging",
-            "novelty_reasoning": "",
-        }
-        tickers = []
+        thesis_statement = ""
+        theme = ""
+        direction = "neutral"
+        mechanism = ""
+        confidence = 0.0
+        time_horizon = "short_term"
+        lifecycle_hint = "emerging"
+        novelty_reasoning = ""
+        ticker_analysis = []
+        implied_tickers = []
         sectors = []
         urgency = "standard"
         materiality = "low"
@@ -495,10 +540,22 @@ def parse_analysis_response(raw_text: str) -> Dict:
     return {
         "skip": skip,
         "skip_reason": skip_reason if skip else None,
-        "thesis": thesis,
-        "tickers": tickers,
+
+        # Spec thesis output (flat, top-level)
+        "thesis_statement": thesis_statement,
+        "theme": theme,
+        "direction": direction,
+        "mechanism": mechanism,
+        "implied_tickers": implied_tickers,
+        "time_horizon": time_horizon,
+        "confidence": confidence,
+        "reasoning": reasoning,
+
+        # Supporting fields for downstream modules
+        "ticker_analysis": ticker_analysis,
         "sectors": sectors,
         "urgency": urgency,
         "materiality": materiality,
-        "reasoning": reasoning,
+        "lifecycle_hint": lifecycle_hint,
+        "novelty_reasoning": novelty_reasoning,
     }

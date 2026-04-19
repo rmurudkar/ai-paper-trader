@@ -481,6 +481,61 @@ Key panels:
 - Settings: current env vars, API key status (configured/not set)
 ```
 
+- Thesis circuit breaker: trips if thesis win rate < 0.35 over 14 days
+- Sentiment circuit breaker: trips if sentiment win rate < 0.40 over 7 days
+- **Materiality circuit breaker**: if high-materiality classification accuracy < 0.60, 
+  disable thesis extraction, fall back to sentiment-only mode
+
+**Learning outputs**:
+- Strategy weights → `weights` table
+- Thesis theme weights → `thesis_weights` table  
+- Lifecycle timing → `lifecycle_weights` table
+- Materiality accuracy → `materiality_performance` table
+
+## 14. Enhanced Thesis Dashboard (dashboard/app.py)
+All data from Turso. Cache TTL: 30s for portfolio/positions, 60s for trades/weights, 120s for thesis data.
+
+**New Tabs**: Positions, Trade History, **Thesis Tracker**, Performance, Signals & Regime, Discovery, Risk Controls, Settings.
+
+**Enhanced panels:**
+
+**Portfolio KPIs** (unchanged):
+- equity, cash (%), buying power, position count vs 15 max, unrealized P&L
+
+**Thesis Tracker** (NEW):
+- **Active Theses Table**: thesis_statement, lifecycle_stage, conviction_score, implied_tickers, evidence_count, days_active
+- **Lifecycle Distribution**: pie chart of theses by stage (EMERGING/DEVELOPING/CONFIRMED/CONSENSUS)
+- **Thesis Performance**: win rate by theme, by lifecycle stage, by conviction level
+- **Recent Evidence**: latest supporting articles per thesis with conviction contribution
+
+**Enhanced Performance**:
+- **Dual win rate charts**: thesis trades vs sentiment trades (separate 7d/14d windows)
+- **Attribution pie**: trade P&L by source (thesis vs sentiment vs technical)
+- **Materiality accuracy**: classification accuracy vs actual trade impact
+- **Lifecycle timing**: performance by entry stage (bar chart)
+
+**Enhanced Learned Weights**:
+- **Strategy weights**: existing bar charts
+- **Thesis theme weights**: AI, earnings, regulatory, M&A, etc. (bar chart)
+- **Lifecycle weights**: EMERGING vs DEVELOPING vs CONFIRMED entry performance
+- **Source credibility**: learned weights for news sources
+
+**Enhanced Circuit Breaker**:
+- **Multi-breaker status**: thesis breaker, sentiment breaker, materiality breaker
+- **Thesis health**: 14-day thesis win rate with 35% threshold
+- **Sentiment health**: 7-day sentiment win rate with 40% threshold  
+- **Materiality health**: classification accuracy with 60% threshold
+
+**Enhanced Discovery**:
+- **Source breakdown**: news vs movers vs **theses** vs positions vs watchlist
+- **Thesis implications**: which active theses drove ticker discovery
+- **Discovery accuracy**: how many discovered tickers became trades
+
+**New Risk Controls**:
+- **Thesis concentration**: % exposure by theme, lifecycle stage
+- **Thesis lifecycle alerts**: theses approaching CONSENSUS (exit warnings)
+- **Stale thesis monitor**: theses with no evidence >4 days (pre-expiry warning)
+```
 
 
 
@@ -559,7 +614,7 @@ Updated Architecture:
 │              (REPLACES sentiment.py)                                │
 │                                                                     │
 │  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │                    analysis.py                                  │ │
+│  │              analysis.py  (router/orchestrator)                 │ │
 │  │                                                                 │ │
 │  │  ┌─────────────────────┐         ┌─────────────────────────────┐ │ │
 │  │  │  HIGH MATERIALITY   │         │   MEDIUM/LOW MATERIALITY    │ │ │
